@@ -77,10 +77,10 @@ ensuring accessibility without requiring additional wearables.
 
 ``` bash
 # Clone repository
-git clone https://github.com/username/balance-ai.git
+git clone https://github.com/cori1219/TS30024.git
 
 # Move to project directory
-cd balance-ai
+cd TS30024
 
 # Install dependencies
 pip install -r requirements.txt
