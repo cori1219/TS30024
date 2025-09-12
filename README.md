@@ -92,10 +92,17 @@ pip install -r requirements.txt
 
 ``` bash
 # Run the model
-python main.py
+python main.py \
+  --data_root ./data \
+  --target_hz 50 \
+  --window_sec 30 --stride_sec 15 \
+  --trim_sec 5 \
+  --epochs_ae 20 \
+  --batch_size 64 --lr 1e-3 \
+  --folds 4 \
+  --latent 32 --hidden 64 \
+  --save_dir ./runs
 ```
-
-Start the balance check through the app interface.
 
 ------------------------------------------------------------------------
 
