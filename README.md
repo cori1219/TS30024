@@ -23,7 +23,7 @@ related to impaired balance, such as drunk driving and elderly falls.
 ## Introduction
 
 Using the built-in IMU sensors in smartphones, this solution collects
-gait data and uses AI models to detect balance anomalies in real-time.\
+gait data and uses AI models to detect balance anomalies in real-time.
 The focus is on enabling **self-check** for users, improving safety, and
 ensuring accessibility without requiring additional wearables.
 
@@ -31,11 +31,11 @@ ensuring accessibility without requiring additional wearables.
 
 ## Vision and Goals
 
--   **Enhance User Safety:** Achieve over 90% detection accuracy\
+-   **Enhance User Safety:** Achieve over 90% detection accuracy
 -   **Expand Self-Check Accessibility:** 50+ pilot users, 80%+ check
-    completion rate\
+    completion rate
 -   **Data-Driven Service Enhancement:** Collect over 2,000 gait data
-    samples\
+    samples
 -   **Early Detection for High-Risk Users:** Monthly self-check for
     high-risk groups
 
@@ -101,18 +101,18 @@ Start the balance check through the app interface.
 
 ## Tech Stack
 
--   **Language:** Python\
--   **AI Models:** LSTM, TSMixer\
--   **Data Processing:** Numpy, Pandas\
+-   **Language:** Python
+-   **AI Models:** LSTM, TSMixer
+-   **Data Processing:** Numpy, Pandas
 -   **Visualization/UI:** Streamlit or Flask
 
 ------------------------------------------------------------------------
 
 ## Roadmap
 
-1.  **Data Collection:** 2025.07 \~ 2025.08\
-2.  **AI Model Development:** 2025.09 \~ 2025.10\
-3.  **Test Tool Implementation:** 2025.11\
+1.  **Data Collection:** 2025.07 \~ 2025.09
+2.  **AI Model Development:** 2025.09 \~ 2025.10
+3.  **Test Tool Implementation:** 2025.11
 4.  **Pilot Testing & Results:** 2025.12
 
 ------------------------------------------------------------------------
