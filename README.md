@@ -66,8 +66,8 @@ ensuring accessibility without requiring additional wearables.
 ## Target Users
 
 -   **Drivers:** Check balance before driving when tired or after
-    drinking\
--   **Post-Drinking Users:** Self-assessment after alcohol consumption\
+    drinking
+-   **Post-Drinking Users:** Self-assessment after alcohol consumption
 -   **Everyday Health Monitors:** Regular balance tracking for
     health-conscious users
 
