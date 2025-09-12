@@ -109,9 +109,9 @@ python main.py \
 ## Tech Stack
 
 -   **Language:** Python
--   **AI Models:** LSTM, TSMixer
--   **Data Processing:** Numpy, Pandas
--   **Visualization/UI:** Streamlit or Flask
+-   **AI Models:** LSTM, TSMixer, ETC.
+-   **Data Processing:** Numpy, Pandas, ETC.
+-   **Visualization/UI:** TBD
 
 ------------------------------------------------------------------------
 
