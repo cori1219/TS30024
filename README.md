@@ -93,7 +93,7 @@ pip install -r requirements.txt
 ``` bash
 # Run the model
 python main.py \
-  --data_root ./data \
+  --data_root ./raw_data \
   --target_hz 50 \
   --window_sec 30 --stride_sec 15 \
   --trim_sec 5 \
