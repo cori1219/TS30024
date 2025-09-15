@@ -121,3 +121,9 @@ python main.py \
 2.  **AI Model Development:** 2025.09 \~ 2025.10
 3.  **Test Tool Implementation:** 2025.11
 4.  **Pilot Testing & Results:** 2025.12
+
+------------------------------------------------------------------------
+
+## Update Log
+
+**v0.0.1:** First version
