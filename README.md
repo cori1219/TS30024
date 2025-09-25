@@ -91,7 +91,7 @@ pip install -r requirements.txt
 ## Usage
 
 ``` bash
-# Run the model v0.0.2 ~ v0.0.3
+# Run the model v0.0.2 ~ v0.0.4
 python main.py \
   --data_root ./raw_data \
   --target_hz 50 \
@@ -127,6 +127,18 @@ python main.py \
 
 ## Update Log
 
+**v0.0.4 — 2025-09-25**
+- **Added**
+  - **글로벌 학습 파이프라인**: 모든 피험자 데이터를 **하나로 합쳐** K-Fold CV 수행.
+  - **채널별 표준화(Channel z-score)**: 훈련 폴드 통계(채널별 mean/std)로 fit → **train/val에 동일 통계 적용**(데이터 누수 방지).
+- **Changed**
+  - 데이터 로딩/윈도 생성은 동일하되, **사람별 루프 제거** → 전 윈도우 단위로 CV.
+  - 시각화/리포트 저장 경로 단순화: `runs_global*/fold{K}_report.json`, `figs_fold{K}/*`, `cv_summary.json`.
+  - 기본 저장 디렉토리 예시 업데이트: `--save_dir ./runs_global_svm`.
+- **Fixed**
+  - 서로 다른 피험자 분포 차이로 인한 스케일 불일치 완화(채널 표준화).
+  - fold 간 통계 누출 가능성 제거(표준화 통계는 **오직 train fold**로 계산).
+
 **v0.0.3 — 2025-09-25**
 - **Added**
   - 곡선 경계 학습: **RBF-SVM** 기반 결정경계 근사 추가(PCA→표준화 후 학습).
@@ -152,5 +164,4 @@ python main.py \
   - `classification_report(..., zero_division=0)`로 경고 억제
 
 **v0.0.1:** First version
-
 
