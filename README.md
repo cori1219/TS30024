@@ -127,15 +127,6 @@ python main.py \
 
 ## Update Log
 
-**v0.0.3 — 2025-09-25**
-- **Added**
-  - 곡선 경계 지원: **RBF-SVM** 기반 결정경계 근사(PCA 2D 상) 추가.
-  - CLI 옵션: `--boundary_mode {rbf_svm|logreg|auto}`, `--svm_c`, `--svm_gamma`.
-- **Changed**
-  - 시각화 타이틀/범례에 경계 타입 표기(`SVM(DAE)`, `SVM(TRUE)`, `LogReg(DAE)` 등).
-- **Fixed**
-  - 경계 학습 라벨이 단일 클래스일 때도 SVM/LogReg가 안전하게 폴백하도록 처리(DAE→TRUE→경계 생략 순).
-
 **v0.0.2 — 2025-09-25**
 - **Added**
   - 사람별 학습 파이프라인: zip 스템에서 subject 추출(패턴 `o_n`/`x_n`) 후 주체별 K-Fold CV.
