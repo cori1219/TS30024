@@ -127,41 +127,46 @@ python main.py \
 
 ## Update Log
 
+**v0.0.5 — 2025-09-25**
+- **Added**
+  - **F1-score 산출/저장**: Train/Test 모두 F1-score 계산.
+  - 콘솔 로그에 `F1 train/test` 출력.
+  - 각 폴드 리포트(`fold{K}_report.json`)와 요약(`cv_summary.json`)에 `"f1"` 필드 추가.
+- **Changed**
+  - 메트릭 계산 유틸을 통합해 ROC-AUC/PR-AUC/F1/리포트를 한 번에 반환.
+- **Fixed**
+  - 소수 클래스 미예측 시 경고 억제: `zero_division=0`로 안정화.
+
 **v0.0.4 — 2025-09-25**
 - **Added**
-  - **글로벌 학습 파이프라인**: 모든 피험자 데이터를 **하나로 합쳐** K-Fold CV 수행.
-  - **채널별 표준화(Channel z-score)**: 훈련 폴드 통계(채널별 mean/std)로 fit → **train/val에 동일 통계 적용**(데이터 누수 방지).
+  - **글로벌 학습 파이프라인**: 모든 피험자 데이터를 합쳐 K-Fold CV.
+  - **채널별 표준화(z-score)**: Train fold 통계로 fit → Train/Val에 동일 적용(데이터 누수 방지).
 - **Changed**
-  - 데이터 로딩/윈도 생성은 동일하되, **사람별 루프 제거** → 전 윈도우 단위로 CV.
-  - 시각화/리포트 저장 경로 단순화: `runs_global*/fold{K}_report.json`, `figs_fold{K}/*`, `cv_summary.json`.
-  - 기본 저장 디렉토리 예시 업데이트: `--save_dir ./runs_global_svm`.
+  - 사람별 루프 제거, 전 윈도우 단위 CV로 단순화.
+  - 저장 경로 정리: `runs_global*/fold{K}_report.json`, `figs_fold{K}/*`, `cv_summary.json`.
 - **Fixed**
-  - 서로 다른 피험자 분포 차이로 인한 스케일 불일치 완화(채널 표준화).
-  - fold 간 통계 누출 가능성 제거(표준화 통계는 **오직 train fold**로 계산).
+  - 피험자 간 스케일 불일치 완화, fold 간 통계 누출 제거.
 
 **v0.0.3 — 2025-09-25**
 - **Added**
-  - 곡선 경계 학습: **RBF-SVM** 기반 결정경계 근사 추가(PCA→표준화 후 학습).
-  - 시각화 강화: 결정함수 **contourf 히트맵 + 0-레벨 경계선(contour)** 출력.
-  - CLI: `--svm_gamma`에 **숫자 문자열**(예: `2.0`, `5.0`) 지원. (`scale`/`auto` 유지)
+  - **RBF-SVM 곡선 경계**(PCA→표준화 후 학습) 및 시각화 강화: 결정함수 `contourf` + 0-레벨 경계선.
+  - CLI: `--svm_gamma`에 **숫자 문자열**(예: `2.0`, `5.0`) 지원 (`scale`/`auto` 유지).
 - **Changed**
-  - PCA 2D 투영 후 **StandardScaler**로 좌표 표준화 → 곡률 표현력 개선.
+  - PCA 2D 후 **StandardScaler** 적용으로 곡률 표현력 개선.
   - 범례/타이틀에 경계 메타 정보 표기: `SVM(DAE, C=..., gamma=...)` 또는 `LogReg(TRUE)`.
 - **Fixed**
-  - 경계 학습 라벨이 단일 클래스인 경우: `DAE→TRUE` 순 폴백, 그래도 단일이면 경계 생략 처리.
-  - 일부 시각화에서 직선처럼 보이던 현상(스케일 불균형) 완화.
+  - 경계 학습 라벨 단일 클래스 시 `DAE→TRUE` 폴백, 그래도 단일이면 경계 생략.
+  - 스케일 불균형으로 직선처럼 보이던 현상 완화.
 
 **v0.0.2 — 2025-09-25**
 - **Added**
-  - **사람별 학습 파이프라인**: zip 스템에서 subject 추출(`o_n`/`x_n`) 후 주체별 K-Fold CV.
-  - 결과 구조 정리: `runs/subject_{ID}/fold{K}_report.json`, `fold{K}_ckpt.pt`, `figs_fold{K}/*`, `all_subjects_summary.json`.
+  - **사람별 학습 파이프라인**: zip 스템(`o_n`/`x_n`)으로 subject 추출, 주체별 K-Fold CV.
+  - 결과 구조: `runs/subject_{ID}/fold{K}_report.json`, `fold{K}_ckpt.pt`, `figs_fold{K}/*`, `all_subjects_summary.json`.
   - Kalman smoothing(잠재 시퀀스), PCA 2D + 로지스틱 경계 근사.
 - **Changed**
-  - 학습 DataLoader `drop_last=False`.
-  - `AE1D`에 `latent_dim` 보관.
+  - DataLoader `drop_last=False`, `AE1D.latent_dim` 보관.
 - **Fixed**
-  - 단일 클래스 라벨 시 LogReg 예외 → TRUE 라벨 대체/경계 생략.
-  - `classification_report(..., zero_division=0)`로 경고 억제
+  - 단일 클래스 라벨 시 LogReg 예외 처리 및 `classification_report(..., zero_division=0)` 적용.
 
 **v0.0.1:** First version
 
