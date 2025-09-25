@@ -143,6 +143,20 @@ python main.py \
 
 ## Update Log
 
+**v0.1.0 — 2025-09-25**  
+- **Added**  
+  - **LSTM 인코더** 지원: 시간 축을 따라 순차적으로 latent 표현을 생성해 시계열 패턴 학습 강화.  
+  - Kalman smoothing과 결합해 **시계열 잠재 표현 안정성** 향상.  
+  - CLI 옵션 `--encoder lstm` 추가 → 기존 CNN 기반 인코더(`--encoder cnn`)와 선택 가능.  
+
+- **Changed**  
+  - 분류 입력으로 LSTM 출력 latent 사용 → 시간적 상관관계 반영.  
+  - Window 기반 데이터 파이프라인 유지하되, LSTM 입력 시 순서 정보 보존.  
+
+- **Fixed**  
+  - 시계열 입력 길이 불일치 시 발생하던 padding 문제 해결.  
+  - LSTM 출력과 분류 헤드 차원 불일치 오류 수정.  
+
 **v0.0.5 — 2025-09-25**
 - **Added**
   - **F1-score 산출/저장**: Train/Test 모두 F1-score 계산.
