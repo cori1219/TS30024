@@ -160,60 +160,52 @@ python main.py \
 
 ## Update Log
 
+**v0.1.1 — 2025-09-26**  
+- **Added**  
+  - **Attention Pooling** for time-series latent aggregation:
+    - `--attn_pool dot` (Dot-Product Attention, default)
+    - `--attn_pool mha` (1-layer Multi-Head Attention + CLS)
+    - `--attn_pool none` (mean pooling; 이전 동작)  
+  - 관련 하이퍼파라미터: `--attn_dropout`, `--attn_heads`(MHA 전용).  
+- **Changed**  
+  - 분류 입력을 **Attention으로 가중합**한 latent로 교체(시간적 중요도 반영).  
+  - 학습/평가 로그에 **Encoder+Pooling 표기**(예: `LSTM + DOT`).  
+- **Fixed**  
+  - Kalman 이후 텐서 전환 시 드문 디바이스/형 변환 경계 케이스 보완.
+
 **v0.1.0 — 2025-09-25**  
 - **Added**  
-  - **LSTM 인코더** 지원: 시간 축을 따라 순차적으로 latent 표현을 생성해 시계열 패턴 학습 강화.  
-  - Kalman smoothing과 결합해 **시계열 잠재 표현 안정성** 향상.  
-  - CLI 옵션 `--encoder lstm` 추가 → 기존 CNN 기반 인코더(`--encoder cnn`)와 선택 가능.  
-
+  - **LSTM 인코더** 지원(`--encoder lstm`), 시계열 의존성 학습 강화.  
+  - Kalman smoothing과 결합한 시계열 잠재 안정화.  
 - **Changed**  
-  - 분류 입력으로 LSTM 출력 latent 사용 → 시간적 상관관계 반영.  
-  - Window 기반 데이터 파이프라인 유지하되, LSTM 입력 시 순서 정보 보존.  
-
+  - 분류 입력을 LSTM 기반 latent로 전환(시계열 정보 보존).  
 - **Fixed**  
-  - 시계열 입력 길이 불일치 시 발생하던 padding 문제 해결.  
-  - LSTM 출력과 분류 헤드 차원 불일치 오류 수정.  
+  - LSTM 출력/헤드 차원 불일치 및 시퀀스 길이 처리 개선.
 
-**v0.0.5 — 2025-09-25**
-- **Added**
-  - **F1-score 산출/저장**: Train/Test 모두 F1-score 계산.
-  - 콘솔 로그에 `F1 train/test` 출력.
-  - 각 폴드 리포트(`fold{K}_report.json`)와 요약(`cv_summary.json`)에 `"f1"` 필드 추가.
-- **Changed**
-  - 메트릭 계산 유틸을 통합해 ROC-AUC/PR-AUC/F1/리포트를 한 번에 반환.
-- **Fixed**
-  - 소수 클래스 미예측 시 경고 억제: `zero_division=0`로 안정화.
+**v0.0.5 — 2025-09-25**  
+- **Added**  
+  - **F1-score** 계산/로그 저장.  
+- **Changed**  
+  - 전처리/리포팅 안정화, 지표 출력 정리.
 
-**v0.0.4 — 2025-09-25**
-- **Added**
-  - **글로벌 학습 파이프라인**: 모든 피험자 데이터를 합쳐 K-Fold CV.
-  - **채널별 표준화(z-score)**: Train fold 통계로 fit → Train/Val에 동일 적용(데이터 누수 방지).
-- **Changed**
-  - 사람별 루프 제거, 전 윈도우 단위 CV로 단순화.
-  - 저장 경로 정리: `runs_global*/fold{K}_report.json`, `figs_fold{K}/*`, `cv_summary.json`.
-- **Fixed**
-  - 피험자 간 스케일 불일치 완화, fold 간 통계 누출 제거.
+**v0.0.4 — 2025-09-25**  
+- **Added**  
+  - 전 피험자 **정규화 후 글로벌 학습** 옵션(데이터 결합).  
+- **Changed**  
+  - 표준화/시각화 파이프라인 정리.
 
-**v0.0.3 — 2025-09-25**
-- **Added**
-  - **RBF-SVM 곡선 경계**(PCA→표준화 후 학습) 및 시각화 강화: 결정함수 `contourf` + 0-레벨 경계선.
-  - CLI: `--svm_gamma`에 **숫자 문자열**(예: `2.0`, `5.0`) 지원 (`scale`/`auto` 유지).
-- **Changed**
-  - PCA 2D 후 **StandardScaler** 적용으로 곡률 표현력 개선.
-  - 범례/타이틀에 경계 메타 정보 표기: `SVM(DAE, C=..., gamma=...)` 또는 `LogReg(TRUE)`.
-- **Fixed**
-  - 경계 학습 라벨 단일 클래스 시 `DAE→TRUE` 폴백, 그래도 단일이면 경계 생략.
-  - 스케일 불균형으로 직선처럼 보이던 현상 완화.
+**v0.0.3 — 2025-09-25**  
+- **Added**  
+  - **RBF-SVM 경계 근사**, `--svm_gamma` 숫자/문자 옵션 지원.  
+- **Changed**  
+  - PCA 후 **StandardScaler** 적용, 경계 시각화 강화.  
+- **Fixed**  
+  - 단일 클래스 경계 학습 시 안전 폴백 처리.
 
-**v0.0.2 — 2025-09-25**
-- **Added**
-  - **사람별 학습 파이프라인**: zip 스템(`o_n`/`x_n`)으로 subject 추출, 주체별 K-Fold CV.
-  - 결과 구조: `runs/subject_{ID}/fold{K}_report.json`, `fold{K}_ckpt.pt`, `figs_fold{K}/*`, `all_subjects_summary.json`.
-  - Kalman smoothing(잠재 시퀀스), PCA 2D + 로지스틱 경계 근사.
-- **Changed**
-  - DataLoader `drop_last=False`, `AE1D.latent_dim` 보관.
-- **Fixed**
-  - 단일 클래스 라벨 시 LogReg 예외 처리 및 `classification_report(..., zero_division=0)` 적용.
+**v0.0.2 — 2025-09-25**  
+- **Added** 사람별 K-Fold CV, Kalman, PCA 2D + 경계 근사, 결과 디렉토리 구조.  
+- **Changed** DataLoader/AE 보완.  
+- **Fixed** 단일 클래스/리포트 경고 대응.
 
 **v0.0.1:** First version
 
