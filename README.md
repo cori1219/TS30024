@@ -127,17 +127,31 @@ python main.py \
 
 ## Update Log
 
+**v0.0.3 — 2025-09-25**
+- **Added**
+  - 곡선 경계 학습: **RBF-SVM** 기반 결정경계 근사 추가(PCA→표준화 후 학습).
+  - 시각화 강화: 결정함수 **contourf 히트맵 + 0-레벨 경계선(contour)** 출력.
+  - CLI: `--svm_gamma`에 **숫자 문자열**(예: `2.0`, `5.0`) 지원. (`scale`/`auto` 유지)
+- **Changed**
+  - PCA 2D 투영 후 **StandardScaler**로 좌표 표준화 → 곡률 표현력 개선.
+  - 범례/타이틀에 경계 메타 정보 표기: `SVM(DAE, C=..., gamma=...)` 또는 `LogReg(TRUE)`.
+- **Fixed**
+  - 경계 학습 라벨이 단일 클래스인 경우: `DAE→TRUE` 순 폴백, 그래도 단일이면 경계 생략 처리.
+  - 일부 시각화에서 직선처럼 보이던 현상(스케일 불균형) 완화.
+
 **v0.0.2 — 2025-09-25**
 - **Added**
-  - 사람별 학습 파이프라인: zip 스템에서 subject 추출(패턴 `o_n`/`x_n`) 후 주체별 K-Fold CV.
-  - 결과 구조: `runs/subject_{ID}/fold{K}_report.json`, `fold{K}_ckpt.pt`, `figs_fold{K}/*`, `all_subjects_summary.json`.
-  - Latent smoothing(Kalman), PCA 2D + 로지스틱 경계 근사.
+  - **사람별 학습 파이프라인**: zip 스템에서 subject 추출(`n.o`/`n.x`, `o_n`/`x_n`) 후 주체별 K-Fold CV.
+  - 결과 구조 정리: `runs/subject_{ID}/fold{K}_report.json`, `fold{K}_ckpt.pt`, `figs_fold{K}/*`, `all_subjects_summary.json`.
+  - Kalman smoothing(잠재 시퀀스), PCA 2D + 로지스틱 경계 근사.
 - **Changed**
   - 학습 DataLoader `drop_last=False`.
   - `AE1D`에 `latent_dim` 보관.
 - **Fixed**
   - 단일 클래스 라벨 시 LogReg 예외 → TRUE 라벨 대체/경계 생략.
   - `classification_report(..., zero_division=0)`로 경고 억제.
+  - 파일명 규칙 보강(`o_1.zip`/`x_1.zip` 등).
 
 **v0.0.1:** First version
+
 
