@@ -128,7 +128,7 @@ python main.py \
 
 **v0.0.2 — 2025-09-25**
 - **Added**
-  - 사람별 학습 파이프라인: zip 스템에서 subject 추출하여(패턴 `n.o`/`n.x`, `o_n`/`x_n`) **동일인 묶음** 후 주체별 K-Fold CV 수행.
+  - 사람별 학습 파이프라인: zip 스템에서 subject 추출하여(패턴 `o_n`/`x_n`) **동일인 묶음** 후 주체별 K-Fold CV 수행.
   - 결과 구조 개선: `runs/subject_{ID}/fold{K}_report.json`, `fold{K}_ckpt.pt`, `figs_fold{K}/*` 및 전체 요약 `all_subjects_summary.json` 저장.
   - Latent smoothing 유지(Kalman), Latent PCA 2D 시각화 + **의사 결정경계**(로지스틱) 생성.
 
