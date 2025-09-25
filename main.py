@@ -2,16 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + 4-Fold CV
-사람별 학습 + PCA 2D 시각화 + SVM 곡선 경계
-- 같은 사람: zip 스템이 `n.o`/`n.x` 또는 `o_n`/`x_n`일 때 subject=n
-- 사람별로 K-Fold CV 수행
+IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + K-Fold CV
+사람별 학습 + PCA 2D 시각화 + SVM 곡선 경계 (표준화 & gamma 숫자 지원)
 """
 
 import os, io, csv, re, math, json, argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -25,6 +23,7 @@ from sklearn.model_selection import KFold
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler  # ★ 표준화
 
 import matplotlib
 matplotlib.use("Agg")
@@ -101,14 +100,26 @@ def _read_csv_robust(raw_bytes: bytes) -> Optional[pd.DataFrame]:
     def try_pd(txt, **kw):
         return pd.read_csv(io.StringIO(txt), engine='python', on_bad_lines='skip', **kw)
 
-    # 1) 자동 구분자+소수점 추정 시도
+    # 1) 기본 시도
     for enc in encodings:
         txt = try_decode(enc)
         if txt is None: continue
         try: return try_pd(txt)
         except: pass
 
-    # 실패 시 None
+    # 2) 헤더/구분자 추정 시도
+    for enc in encodings:
+        txt = try_decode(enc)
+        if txt is None: continue
+        try:
+            sample = "\n".join([ln for ln in txt.splitlines() if ln.strip()][:80])
+            sniff_sep = csv.Sniffer().sniff(sample, delimiters=",\t;|").delimiter
+        except: sniff_sep = None
+        for sep in [sniff_sep, ',', '\t', ';', '|']:
+            if not sep: continue
+            try: return try_pd(txt, sep=sep)
+            except: pass
+
     return None
 
 
@@ -126,7 +137,6 @@ def _parse_sensor_csv(raw_bytes: bytes, zip_name: str, inner_name: str) -> Optio
         _dump_head(raw_bytes, zip_name, inner_name); return None
 
     df.columns = [str(c).strip().lower() for c in df.columns]
-
     tcol = None
     for cand in ['timestamp','time','datetime']:
         if cand in df.columns: tcol = cand; break
@@ -138,8 +148,10 @@ def _parse_sensor_csv(raw_bytes: bytes, zip_name: str, inner_name: str) -> Optio
         _dump_head(raw_bytes, zip_name, inner_name); return None
 
     def find_axis(cols, key):
+        if key in cols: return key
+        pat = re.compile(rf'(^|[^a-z]){key}([^a-z]|$)')
         for c in cols:
-            if re.search(rf'(^|[^a-z]){key}([^a-z]|$)', c): return c
+            if pat.search(c): return c
         return None
 
     cx = find_axis(df.columns, 'x'); cy = find_axis(df.columns, 'y'); cz = find_axis(df.columns, 'z')
@@ -215,18 +227,15 @@ def collate_fn(batch):
 
 def build_windows_from_series(df: pd.DataFrame, win_sec: int, stride_sec: int, label: int,
                               target_hz: int, group: str, subject: str, trim_sec: int = 5):
-    # 채널 정리
     for c in SENSOR_COLS:
         if c not in df.columns: df[c] = np.nan
         df[c] = pd.to_numeric(df[c], errors='coerce')
     df = df.dropna(subset=SENSOR_COLS)
     if df.empty: return []
-    # 앞뒤 trim
     if trim_sec and trim_sec > 0:
         n_trim = trim_sec * target_hz
         if len(df) > n_trim * 2: df = df.iloc[n_trim:-n_trim]
         else: return []
-
     arr = df[SENSOR_COLS].to_numpy(dtype=np.float32)
     win_len = win_sec * target_hz; stride = stride_sec * target_hz
     ws = window_stack(arr, win_len, stride)
@@ -429,30 +438,32 @@ def dae_logits_and_latent(ae: AE1D, clf_head: LatentClassifier, loader: DataLoad
         return np.array([]), np.array([]), np.zeros((0, ae.latent_dim), dtype=np.float32)
 
 
-# ------------------ Visualization: PCA 2D + Curved Boundary ------------------
+# ------------------ PCA + Curved Boundary (with Standardization) ------------------
 def _plot_latent_pca_with_dae_boundary(
-    X_latent_tr, y_true_tr, dae_pred_tr,
-    X_latent_te, y_true_te, dae_pred_te,
-    out_tr, out_te, title_tr, title_te,
-    boundary_mode='rbf_svm', svm_c=1.0, svm_gamma='scale'
+    X_latent_tr: np.ndarray, y_true_tr: np.ndarray, dae_pred_tr: np.ndarray,
+    X_latent_te: np.ndarray, y_true_te: np.ndarray, dae_pred_te: np.ndarray,
+    out_tr: Path, out_te: Path, title_tr: str, title_te: str,
+    boundary_mode: str = 'rbf_svm', svm_c: float = 1.0, svm_gamma: Union[str,float] = 'scale'
 ):
     """
-    PCA 2D로 잠재공간 투영 후, 지정된 방식으로 결정경계를 근사하여 그림.
-    - boundary_mode:
-        'rbf_svm' : RBF 커널 SVM (곡선 경계)
-        'logreg'  : 로지스틱 (직선 경계)
-        'auto'    : 가능하면 SVM, 예외/불가 시 로지스틱
-    - 라벨 선택: 기본 DAE 예측 → 단일 클래스면 true label 대체 → 여전히 단일이면 경계 생략
+    PCA(2D) → StandardScaler → 분류기(SVM/LogReg) → contourf + boundary
+    - boundary_mode: 'rbf_svm' | 'logreg' | 'auto'
+    - svm_gamma: 'scale'/'auto' 또는 float (예: 2.0)
     """
     if X_latent_tr.shape[0] == 0:
         return
 
-    # 1) PCA 투영
+    # 1) PCA 2D
     pca = PCA(n_components=2, random_state=42)
     Ztr = pca.fit_transform(X_latent_tr)
     Zte = pca.transform(X_latent_te) if X_latent_te.shape[0] else np.zeros((0, 2))
 
-    # 2) 경계 학습용 라벨
+    # 1.5) Standardization (곡선 표현 강화)
+    scaler = StandardScaler()
+    Ztr_s = scaler.fit_transform(Ztr)
+    Zte_s = scaler.transform(Zte) if Zte.shape[0] else np.zeros((0,2))
+
+    # 2) 경계 학습 라벨 선택
     lab_tr = dae_pred_tr.astype(int); source = "DAE"
     if np.unique(lab_tr).size < 2:
         if np.unique(y_true_tr.astype(int)).size >= 2:
@@ -460,55 +471,58 @@ def _plot_latent_pca_with_dae_boundary(
         else:
             lab_tr = None  # 경계 생략
 
-    # 3) 분류기 선택/학습
+    # 3) 분류기 학습
     clf = None; tag = None
     if lab_tr is not None:
         mode = boundary_mode
-        if mode == 'auto':
+        # 우선 SVM 시도 (auto 면 SVM 먼저)
+        if mode in ('rbf_svm', 'auto'):
             try:
                 clf = SVC(kernel='rbf', C=svm_c, gamma=svm_gamma, class_weight='balanced')
-                clf.fit(Ztr, lab_tr); tag = f"SVM({source})"
-            except Exception:
-                mode = 'logreg'
-        if mode == 'rbf_svm' and clf is None:
-            try:
-                clf = SVC(kernel='rbf', C=svm_c, gamma=svm_gamma, class_weight='balanced')
-                clf.fit(Ztr, lab_tr); tag = f"SVM({source})"
+                clf.fit(Ztr_s, lab_tr)
+                tag = f"SVM({source}, C={svm_c}, gamma={svm_gamma})"
             except Exception:
                 clf = None
-        if mode == 'logreg' and clf is None:
+                # auto면 logreg로 폴백
+                if mode == 'auto':
+                    mode = 'logreg'
+        # 로지스틱
+        if (mode == 'logreg') and (clf is None):
             try:
                 clf = LogisticRegression(class_weight='balanced', max_iter=200)
-                clf.fit(Ztr, lab_tr); tag = f"LogReg({source})"
+                clf.fit(Ztr_s, lab_tr)
+                tag = f"LogReg({source})"
             except Exception:
                 clf = None
 
-    # 4) 그림
-    def plot_one(Z, y_true, fname, title):
-        if Z.shape[0] == 0:
+    # 4) 그림 (스케일된 좌표계에서)
+    def plot_one(Zs, y_true, fname, title):
+        if Zs.shape[0] == 0:
             return
         plt.figure()
         idx0 = (y_true == 0); idx1 = (y_true == 1)
-        plt.scatter(Z[idx0, 0], Z[idx0, 1], s=12, label='normal (true)')
-        plt.scatter(Z[idx1, 0], Z[idx1, 1], s=12, label='abnormal (true)')
+        plt.scatter(Zs[idx0,0], Zs[idx0,1], s=12, label='normal (true)')
+        plt.scatter(Zs[idx1,0], Zs[idx1,1], s=12, label='abnormal (true)')
 
-        if clf is not None:
-            x_min, x_max = np.percentile(Z[:, 0], 1), np.percentile(Z[:, 0], 99)
-            y_min, y_max = np.percentile(Z[:, 1], 1), np.percentile(Z[:, 1], 99)
-            xx, yy = np.meshgrid(np.linspace(x_min, x_max, 300),
-                                 np.linspace(y_min, y_max, 300))
+        if clf is not None and Zs.shape[0] > 5:
+            x_min, x_max = np.percentile(Zs[:,0], 1), np.percentile(Zs[:,0], 99)
+            y_min, y_max = np.percentile(Zs[:,1], 1), np.percentile(Zs[:,1], 99)
+            xx, yy = np.meshgrid(np.linspace(x_min, x_max, 400),
+                                 np.linspace(y_min, y_max, 400))
             grid = np.c_[xx.ravel(), yy.ravel()]
-            # margin (decision_function) 사용
             zz = clf.decision_function(grid).reshape(xx.shape)
-            cs = plt.contour(xx, yy, zz, levels=[0.0])
+
+            # 결정함수 히트맵과 경계선(0 레벨)
+            plt.contourf(xx, yy, zz, levels=np.linspace(zz.min(), zz.max(), 20), alpha=0.25)
+            cs = plt.contour(xx, yy, zz, levels=[0.0], linewidths=2)
             if cs.collections and tag:
-                cs.collections[0].set_label(f'{tag} boundary')
+                cs.collections[0].set_label(tag)
 
         plt.title(title); plt.legend(); plt.tight_layout()
         plt.savefig(fname, dpi=150); plt.close()
 
-    plot_one(Ztr, y_true_tr, out_tr, title_tr)
-    plot_one(Zte, y_true_te, out_te, title_te)
+    plot_one(Ztr_s, y_true_tr, out_tr, title_tr)
+    plot_one(Zte_s, y_true_te, out_te, title_te)
 
 
 # ------------------ Confusion matrix plot ------------------
@@ -516,17 +530,14 @@ def _plot_confusion(y_true, y_pred, outpath, title):
     if y_true.size == 0 or y_pred.size == 0:
         return
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-
     plt.figure()
     plt.imshow(cm, interpolation='nearest')
     plt.title(title)
     plt.xticks([0, 1], ['normal', 'abnormal'])
     plt.yticks([0, 1], ['normal', 'abnormal'])
-
     for i in range(2):
         for j in range(2):
             plt.text(j, i, str(cm[i, j]), ha='center', va='center')
-
     plt.xlabel('Predicted (DAE)')
     plt.ylabel('True')
     plt.tight_layout()
@@ -552,7 +563,15 @@ class Args:
     save_dir: str
     boundary_mode: str   # 'rbf_svm' | 'logreg' | 'auto'
     svm_c: float
-    svm_gamma: str       # 'scale' | 'auto'
+    svm_gamma: Union[str, float]  # 'scale'|'auto'|float
+
+
+def _parse_gamma(g: str) -> Union[str, float]:
+    """ 'scale'/'auto' 그대로, 숫자 문자열은 float 변환 """
+    try:
+        return float(g)
+    except:
+        return g
 
 
 # ------------------ Run (Per Subject CV) ------------------
@@ -573,6 +592,8 @@ def run(args: Args):
 
     os.makedirs(args.save_dir, exist_ok=True)
     global_summary = []
+
+    svm_gamma_final = _parse_gamma(str(args.svm_gamma))  # 숫자도 허용
 
     for sid in subjects:
         subj_items = [it for it in items if it.subject == sid]
@@ -656,9 +677,9 @@ def run(args: Args):
                 X_latent_te=Zte, y_true_te=y_te, dae_pred_te=(p_te>=0.5).astype(int),
                 out_tr=figs_dir/"train_latent_pca_boundary.png",
                 out_te=figs_dir/"test_latent_pca_boundary.png",
-                title_tr=f"Subject {sid} — Fold {fold} — Train Latent (PCA) + boundary",
-                title_te=f"Subject {sid} — Fold {fold} — Test Latent (PCA) + boundary",
-                boundary_mode=args.boundary_mode, svm_c=args.svm_c, svm_gamma=args.svm_gamma
+                title_tr=f"Subject {sid} — Fold {fold} — Train Latent (PCA+Std) + boundary",
+                title_te=f"Subject {sid} — Fold {fold} — Test Latent (PCA+Std) + boundary",
+                boundary_mode=args.boundary_mode, svm_c=args.svm_c, svm_gamma=svm_gamma_final
             )
 
             _plot_confusion(y_tr.astype(int), (p_tr>=0.5).astype(int), figs_dir/"train_confusion_dae.png",
@@ -696,7 +717,19 @@ if __name__ == "__main__":
                    choices=['rbf_svm','logreg','auto'],
                    help="경계 근사 방식: rbf_svm(곡선, 기본), logreg(직선), auto(가능하면 SVM)")
     p.add_argument('--svm_c', type=float, default=1.0, help='RBF-SVM C')
-    p.add_argument('--svm_gamma', type=str, default='scale', choices=['scale','auto'], help='RBF-SVM gamma')
+    p.add_argument('--svm_gamma', type=str, default='scale',
+                   help="RBF-SVM gamma: 'scale'/'auto' 또는 숫자 문자열(예: '2.0')")
     args_ns = p.parse_args()
-    run(Args(**vars(args_ns)))
+
+    # argparse는 문자열로 받으므로, 숫자면 float로 변환
+    gamma_val: Union[str, float] = _parse_gamma(args_ns.svm_gamma)
+    args = Args(
+        data_root=args_ns.data_root, target_hz=args_ns.target_hz,
+        window_sec=args_ns.window_sec, stride_sec=args_ns.stride_sec, trim_sec=args_ns.trim_sec,
+        epochs_ae=args_ns.epochs_ae, batch_size=args_ns.batch_size, lr=args_ns.lr,
+        folds=args_ns.folds, latent=args_ns.latent, hidden=args_ns.hidden,
+        device=args_ns.device, save_dir=args_ns.save_dir,
+        boundary_mode=args_ns.boundary_mode, svm_c=args_ns.svm_c, svm_gamma=gamma_val
+    )
+    run(args)
 
