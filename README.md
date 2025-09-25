@@ -91,7 +91,7 @@ pip install -r requirements.txt
 ## Usage
 
 ``` bash
-# Run the model until v0.0.3
+# Run the model v0.0.2 ~ v0.0.3
 python main.py \
   --data_root ./raw_data \
   --target_hz 50 \
