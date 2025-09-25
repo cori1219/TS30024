@@ -4,6 +4,7 @@
 """
 IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + K-Fold CV
 전 피험자 합본(Global) 학습 + 훈련 통계로 채널별 표준화 + PCA 2D 시각화 + SVM/LogReg 경계
+F1-score 출력/저장 추가 (train/test)
 """
 
 import os, io, csv, re, math, json, argparse
@@ -18,7 +19,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from sklearn.metrics import classification_report, roc_auc_score, average_precision_score, confusion_matrix
+from sklearn.metrics import (
+    classification_report, roc_auc_score, average_precision_score,
+    confusion_matrix, f1_score
+)
 from sklearn.model_selection import KFold
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
@@ -100,12 +104,14 @@ def _read_csv_robust(raw_bytes: bytes) -> Optional[pd.DataFrame]:
     def try_pd(txt, **kw):
         return pd.read_csv(io.StringIO(txt), engine='python', on_bad_lines='skip', **kw)
 
+    # 1) 기본 시도
     for enc in encodings:
         txt = try_decode(enc)
         if txt is None: continue
         try: return try_pd(txt)
         except: pass
 
+    # 2) 헤더/구분자 추정 시도
     for enc in encodings:
         txt = try_decode(enc)
         if txt is None: continue
@@ -233,7 +239,7 @@ class ChannelNormalizer:
         self.std  = np.sqrt(np.maximum(v, 1e-8)).astype(np.float32)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B,C,T] (torch)
+        # x: [B,C,T]
         mean = torch.from_numpy(self.mean).to(x.device).view(1, -1, 1)
         std  = torch.from_numpy(self.std ).to(x.device).view(1, -1, 1)
         return (x - mean) / std
@@ -472,33 +478,28 @@ def _plot_latent_pca_with_dae_boundary(
             lab_tr = None
 
     clf = None; tag = None
+    mode = boundary_mode
     if lab_tr is not None:
-        mode = boundary_mode
         if mode in ('rbf_svm', 'auto'):
             try:
                 clf = SVC(kernel='rbf', C=svm_c, gamma=svm_gamma, class_weight='balanced')
-                clf.fit(Ztr_s, lab_tr)
-                tag = f"SVM({source}, C={svm_c}, gamma={svm_gamma})"
+                clf.fit(Ztr_s, lab_tr); tag = f"SVM({source}, C={svm_c}, gamma={svm_gamma})"
             except Exception:
                 clf = None
-                if mode == 'auto':
-                    mode = 'logreg'
+                if mode == 'auto': mode = 'logreg'
         if (mode == 'logreg') and (clf is None):
             try:
                 clf = LogisticRegression(class_weight='balanced', max_iter=200)
-                clf.fit(Ztr_s, lab_tr)
-                tag = f"LogReg({source})"
+                clf.fit(Ztr_s, lab_tr); tag = f"LogReg({source})"
             except Exception:
                 clf = None
 
     def plot_one(Zs, y_true, fname, title):
-        if Zs.shape[0] == 0:
-            return
+        if Zs.shape[0] == 0: return
         plt.figure()
         idx0 = (y_true == 0); idx1 = (y_true == 1)
         plt.scatter(Zs[idx0,0], Zs[idx0,1], s=12, label='normal (true)')
         plt.scatter(Zs[idx1,0], Zs[idx1,1], s=12, label='abnormal (true)')
-
         if clf is not None and Zs.shape[0] > 5:
             x_min, x_max = np.percentile(Zs[:,0], 1), np.percentile(Zs[:,0], 99)
             y_min, y_max = np.percentile(Zs[:,1], 1), np.percentile(Zs[:,1], 99)
@@ -506,12 +507,9 @@ def _plot_latent_pca_with_dae_boundary(
                                  np.linspace(y_min, y_max, 400))
             grid = np.c_[xx.ravel(), yy.ravel()]
             zz = clf.decision_function(grid).reshape(xx.shape)
-
             plt.contourf(xx, yy, zz, levels=np.linspace(zz.min(), zz.max(), 20), alpha=0.25)
             cs = plt.contour(xx, yy, zz, levels=[0.0], linewidths=2)
-            if cs.collections and tag:
-                cs.collections[0].set_label(tag)
-
+            if cs.collections and tag: cs.collections[0].set_label(tag)
         plt.title(title); plt.legend(); plt.tight_layout()
         plt.savefig(fname, dpi=150); plt.close()
 
@@ -521,8 +519,7 @@ def _plot_latent_pca_with_dae_boundary(
 
 # ------------------ Confusion matrix plot ------------------
 def _plot_confusion(y_true, y_pred, outpath, title):
-    if y_true.size == 0 or y_pred.size == 0:
-        return
+    if y_true.size == 0 or y_pred.size == 0: return
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     plt.figure()
     plt.imshow(cm, interpolation='nearest')
@@ -532,11 +529,8 @@ def _plot_confusion(y_true, y_pred, outpath, title):
     for i in range(2):
         for j in range(2):
             plt.text(j, i, str(cm[i, j]), ha='center', va='center')
-    plt.xlabel('Predicted (DAE)')
-    plt.ylabel('True')
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=150)
-    plt.close()
+    plt.xlabel('Predicted (DAE)'); plt.ylabel('True')
+    plt.tight_layout(); plt.savefig(outpath, dpi=150); plt.close()
 
 
 # ------------------ Args ------------------
@@ -561,10 +555,8 @@ class Args:
 
 
 def _parse_gamma(g: str) -> Union[str, float]:
-    try:
-        return float(g)
-    except:
-        return g
+    try: return float(g)
+    except: return g
 
 
 # ------------------ Run (Global CV with channel normalization) ------------------
@@ -591,10 +583,10 @@ def run(args: Args):
         train_items = [items[i] for i in train_idx]
         val_items   = [items[i] for i in val_idx]
 
-        # --- 훈련 폴드로 채널별 표준화 통계 산출 ---
+        # --- 채널별 표준화 통계 (train fold) ---
         ch_norm = ChannelNormalizer(); ch_norm.fit(train_items)
 
-        # --- 모델 구성 ---
+        # --- 모델 ---
         ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
         clf_head = LatentClassifier(in_dim=args.latent, hidden=args.hidden).to(device)
         proj_head = ProjectionHead(in_dim=args.latent, proj_dim=64).to(device)
@@ -615,31 +607,35 @@ def run(args: Args):
         else:
             print("[WARN] Empty training set for DAE.")
 
-        # --- 평가 (DAE 확률/예측 + 잠재 수집) ---
+        # --- 평가 & 메트릭 ---
         print("[INFO] Evaluate & collect latent...")
         p_tr, y_tr, Ztr = dae_logits_and_latent(ae, clf_head, tr_loader, device)
         p_te, y_te, Zte = dae_logits_and_latent(ae, clf_head, va_loader, device)
 
         def to_metrics(p, y):
-            if y.size==0: return (float('nan'), float('nan'), {}), np.array([]).astype(int)
+            if y.size==0:
+                return (float('nan'), float('nan'), float('nan'), {}), np.array([]).astype(int)
             yhat = (p>=0.5).astype(int)
             try: roc = roc_auc_score(y, p)
             except: roc = float('nan')
             try: pr  = average_precision_score(y, p)
             except: pr = float('nan')
+            f1 = f1_score(y.astype(int), yhat.astype(int), zero_division=0)
             rep = classification_report(y, yhat, output_dict=True, zero_division=0)
-            return (roc, pr, rep), yhat
+            return (roc, pr, f1, rep), yhat
 
-        (roc_tr, pr_tr, rep_tr), y_tr_hat = to_metrics(p_tr, y_tr)
-        (roc_te, pr_te, rep_te), y_te_hat = to_metrics(p_te, y_te)
+        (roc_tr, pr_tr, f1_tr, rep_tr), y_tr_hat = to_metrics(p_tr, y_tr)
+        (roc_te, pr_te, f1_te, rep_te), y_te_hat = to_metrics(p_te, y_te)
 
-        print(f"[FOLD {fold}] ROC-AUC (train)={roc_tr:.4f} (test)={roc_te:.4f} | PR-AUC (train)={pr_tr:.4f} (test)={pr_te:.4f}")
+        print(f"[FOLD {fold}] ROC-AUC train/test = {roc_tr:.4f} / {roc_te:.4f}")
+        print(f"[FOLD {fold}] PR-AUC  train/test = {pr_tr:.4f} / {pr_te:.4f}")
+        print(f"[FOLD {fold}] F1      train/test = {f1_tr:.4f} / {f1_te:.4f}")
 
         # 저장
         fold_report = {
             "fold": fold,
-            "train": {"roc_auc": roc_tr, "pr_auc": pr_tr, "report": rep_tr},
-            "test":  {"roc_auc": roc_te, "pr_auc": pr_te, "report": rep_te},
+            "train": {"roc_auc": roc_tr, "pr_auc": pr_tr, "f1": f1_tr, "report": rep_tr},
+            "test":  {"roc_auc": roc_te, "pr_auc": pr_te, "f1": f1_te, "report": rep_te},
         }
         cv_reports.append(fold_report)
         with open(Path(args.save_dir)/f"fold{fold}_report.json",'w') as f: json.dump(fold_report, f, indent=2)
