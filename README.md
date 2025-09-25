@@ -16,7 +16,7 @@ related to impaired balance, such as drunk driving and elderly falls.
 6.  [Usage](#usage)
 7.  [Tech Stack](#tech-stack)
 8.  [Roadmap](#roadmap)
-9.  [License](#license)
+9.  [Update Log](#Update Log)
 
 ------------------------------------------------------------------------
 
