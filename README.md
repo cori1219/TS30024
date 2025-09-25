@@ -141,7 +141,7 @@ python main.py \
 
 **v0.0.2 — 2025-09-25**
 - **Added**
-  - **사람별 학습 파이프라인**: zip 스템에서 subject 추출(`n.o`/`n.x`, `o_n`/`x_n`) 후 주체별 K-Fold CV.
+  - **사람별 학습 파이프라인**: zip 스템에서 subject 추출(`o_n`/`x_n`) 후 주체별 K-Fold CV.
   - 결과 구조 정리: `runs/subject_{ID}/fold{K}_report.json`, `fold{K}_ckpt.pt`, `figs_fold{K}/*`, `all_subjects_summary.json`.
   - Kalman smoothing(잠재 시퀀스), PCA 2D + 로지스틱 경계 근사.
 - **Changed**
@@ -149,8 +149,7 @@ python main.py \
   - `AE1D`에 `latent_dim` 보관.
 - **Fixed**
   - 단일 클래스 라벨 시 LogReg 예외 → TRUE 라벨 대체/경계 생략.
-  - `classification_report(..., zero_division=0)`로 경고 억제.
-  - 파일명 규칙 보강(`o_1.zip`/`x_1.zip` 등).
+  - `classification_report(..., zero_division=0)`로 경고 억제
 
 **v0.0.1:** First version
 
