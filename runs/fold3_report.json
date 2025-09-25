@@ -1,0 +1,68 @@
+{
+  "fold": 3,
+  "encoder": "LSTM(hidden=64, latent=32, layers=1, bidir=True)",
+  "train": {
+    "roc_auc": 0.9382538377192983,
+    "pr_auc": 0.951719383084353,
+    "f1": 0.6918918918918919,
+    "report": {
+      "0.0": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1-score": 0.0,
+        "support": 114.0
+      },
+      "1.0": {
+        "precision": 0.5289256198347108,
+        "recall": 1.0,
+        "f1-score": 0.6918918918918919,
+        "support": 128.0
+      },
+      "accuracy": 0.5289256198347108,
+      "macro avg": {
+        "precision": 0.2644628099173554,
+        "recall": 0.5,
+        "f1-score": 0.34594594594594597,
+        "support": 242.0
+      },
+      "weighted avg": {
+        "precision": 0.279762311317533,
+        "recall": 0.5289256198347108,
+        "f1-score": 0.36595934777752964,
+        "support": 242.0
+      }
+    }
+  },
+  "test": {
+    "roc_auc": 0.9343339587242026,
+    "pr_auc": 0.9581321826971159,
+    "f1": 0.6833333333333333,
+    "report": {
+      "0.0": {
+        "precision": 1.0,
+        "recall": 0.02564102564102564,
+        "f1-score": 0.05,
+        "support": 39.0
+      },
+      "1.0": {
+        "precision": 0.5189873417721519,
+        "recall": 1.0,
+        "f1-score": 0.6833333333333333,
+        "support": 41.0
+      },
+      "accuracy": 0.525,
+      "macro avg": {
+        "precision": 0.759493670886076,
+        "recall": 0.5128205128205128,
+        "f1-score": 0.3666666666666667,
+        "support": 80.0
+      },
+      "weighted avg": {
+        "precision": 0.7534810126582279,
+        "recall": 0.525,
+        "f1-score": 0.3745833333333333,
+        "support": 80.0
+      }
+    }
+  }
+}

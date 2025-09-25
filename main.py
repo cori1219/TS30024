@@ -4,7 +4,7 @@
 """
 IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + K-Fold CV
 전 피험자 합본(Global) 학습 + 훈련 통계로 채널별 표준화 + PCA 2D 시각화 + SVM/LogReg 경계
-F1-score 출력/저장 추가 (train/test)
+Encoder 옵션: Conv1D 또는 LSTM (기본 LSTM)
 """
 
 import os, io, csv, re, math, json, argparse
@@ -238,12 +238,6 @@ class ChannelNormalizer:
         self.mean = m.astype(np.float32)
         self.std  = np.sqrt(np.maximum(v, 1e-8)).astype(np.float32)
 
-    def transform(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B,C,T]
-        mean = torch.from_numpy(self.mean).to(x.device).view(1, -1, 1)
-        std  = torch.from_numpy(self.std ).to(x.device).view(1, -1, 1)
-        return (x - mean) / std
-
 class WindowDatasetTorch(Dataset):
     def __init__(self, items: List[WindowData], normalizer: Optional[ChannelNormalizer] = None):
         self.items = items; self.norm = normalizer
@@ -252,7 +246,9 @@ class WindowDatasetTorch(Dataset):
         w = self.items[idx]
         x = torch.from_numpy(w.feats)  # [C,T]
         if self.norm is not None and self.norm.mean is not None:
-            x = (x - torch.from_numpy(self.norm.mean).view(-1,1)) / torch.from_numpy(self.norm.std).view(-1,1)
+            mean = torch.from_numpy(self.norm.mean).view(-1,1)
+            std  = torch.from_numpy(self.norm.std).view(-1,1)
+            x = (x - mean) / std
         return x, torch.tensor(w.label, dtype=torch.float32)
 
 def collate_fn(batch):
@@ -302,6 +298,7 @@ class SimpleKalman:
 
 
 # ------------------ Models ------------------
+# Conv1D AE (기존)
 class Encoder1D(nn.Module):
     def __init__(self, in_ch=6, hidden=64, latent=32):
         super().__init__()
@@ -330,10 +327,70 @@ class AE1D(nn.Module):
         self.enc = Encoder1D(in_ch, hidden, latent)
         self.dec = Decoder1D(latent, hidden, in_ch)
     def forward(self, x):
-        z = self.enc(x); xr = self.dec(z)
+        z = self.enc(x)            # [B,D,T]
+        xr = self.dec(z)           # [B,C,T]
         return xr, z
     def pooled_latent(self, z):
-        return z.mean(dim=-1)  # [B,latent]
+        return z.mean(dim=-1)  # [B,D]
+
+
+# LSTM AE (신규)
+class EncoderLSTM(nn.Module):
+    def __init__(self, in_ch=6, hidden=64, latent=32, num_layers=1, bidirectional=False, dropout=0.0):
+        super().__init__()
+        self.bidirectional = bidirectional
+        self.lstm = nn.LSTM(
+            input_size=in_ch,
+            hidden_size=hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        dir_mul = 2 if bidirectional else 1
+        self.to_latent = nn.Linear(hidden*dir_mul, latent)
+
+    def forward(self, x):  # x: [B,C,T]
+        x_seq = x.transpose(1, 2)        # [B,T,C]
+        h, _ = self.lstm(x_seq)          # [B,T,H*dir]
+        z_seq = self.to_latent(h)        # [B,T,latent]
+        z = z_seq.transpose(1, 2)        # [B,latent,T] (Conv버전과 동일 인터페이스)
+        return z, z_seq                  # z (for pooling/Kalman), z_seq (for decoder)
+
+class DecoderLSTM(nn.Module):
+    def __init__(self, latent=32, hidden=64, out_ch=6, num_layers=1, bidirectional=False, dropout=0.0):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=latent,
+            hidden_size=hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=False,        # decoder는 일반적으로 단방향
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.to_output = nn.Linear(hidden, out_ch)
+
+    def forward(self, z_seq):  # z_seq: [B,T,latent]
+        y, _ = self.lstm(z_seq)         # [B,T,H]
+        out_seq = self.to_output(y)     # [B,T,C]
+        out = out_seq.transpose(1, 2)   # [B,C,T]
+        return out
+
+class AELSTM(nn.Module):
+    def __init__(self, in_ch=6, hidden=64, latent=32, num_layers=1, bidirectional=False, dropout=0.0):
+        super().__init__()
+        self.latent_dim = latent
+        self.enc = EncoderLSTM(in_ch, hidden, latent, num_layers, bidirectional, dropout)
+        self.dec = DecoderLSTM(latent, hidden, in_ch, num_layers, False, dropout)
+
+    def forward(self, x):
+        z, z_seq = self.enc(x)    # z:[B,D,T], z_seq:[B,T,D]
+        xr = self.dec(z_seq)      # [B,C,T]
+        return xr, z
+
+    def pooled_latent(self, z):
+        return z.mean(dim=-1)     # [B,D]
+
 
 class ProjectionHead(nn.Module):
     def __init__(self, in_dim, proj_dim=64):
@@ -377,7 +434,7 @@ class LatentClassifier(nn.Module):
 
 # ------------------ Training (Discriminative AE) ------------------
 def train_discriminative_ae(
-    ae: AE1D,
+    ae: Union[AE1D, AELSTM],
     clf_head: LatentClassifier,
     proj_head: ProjectionHead,
     loader: DataLoader,
@@ -420,7 +477,7 @@ def train_discriminative_ae(
                     logits = clf_head(z_pool)
                     z_proj = proj_head(z_pool)
                     loss_rec = recon(xr, xb)
-                    loss_con = supcon(z_proj, yb)
+                    loss_con = SupConLoss(temperature)(z_proj, yb)
                     loss_cls = bce(logits, yb)
                     s += (w_rec*loss_rec + w_con*loss_con + w_cls*loss_cls).item() * xb.size(0); m += xb.size(0)
             val = s / max(1,m)
@@ -430,7 +487,7 @@ def train_discriminative_ae(
 
 # ------------------ Inference helpers (DAE logits + latent) ------------------
 @torch.no_grad()
-def dae_logits_and_latent(ae: AE1D, clf_head: LatentClassifier, loader: DataLoader, device: str, kalman_proc=1e-3, kalman_meas=1e-2):
+def dae_logits_and_latent(ae: Union[AE1D, AELSTM], clf_head: LatentClassifier, loader: DataLoader, device: str, kalman_proc=1e-3, kalman_meas=1e-2):
     ae.eval(); clf_head.eval()
     probs_list=[]; y_list=[]; latent_list=[]
     for xb, yb in loader:
@@ -552,6 +609,11 @@ class Args:
     boundary_mode: str   # 'rbf_svm' | 'logreg' | 'auto'
     svm_c: float
     svm_gamma: Union[str, float]  # 'scale'|'auto'|float
+    # encoder 선택 + LSTM 하이퍼파라미터
+    encoder: str
+    lstm_layers: int
+    lstm_bidir: bool
+    lstm_dropout: float
 
 
 def _parse_gamma(g: str) -> Union[str, float]:
@@ -587,7 +649,18 @@ def run(args: Args):
         ch_norm = ChannelNormalizer(); ch_norm.fit(train_items)
 
         # --- 모델 ---
-        ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
+        if args.encoder == 'lstm':
+            ae: Union[AE1D, AELSTM] = AELSTM(
+                in_ch=len(SENSOR_COLS),
+                hidden=args.hidden,
+                latent=args.latent,
+                num_layers=args.lstm_layers,
+                bidirectional=args.lstm_bidir,
+                dropout=args.lstm_dropout
+            ).to(device)
+        else:
+            ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
+
         clf_head = LatentClassifier(in_dim=args.latent, hidden=args.hidden).to(device)
         proj_head = ProjectionHead(in_dim=args.latent, proj_dim=64).to(device)
 
@@ -630,10 +703,13 @@ def run(args: Args):
         print(f"[FOLD {fold}] ROC-AUC train/test = {roc_tr:.4f} / {roc_te:.4f}")
         print(f"[FOLD {fold}] PR-AUC  train/test = {pr_tr:.4f} / {pr_te:.4f}")
         print(f"[FOLD {fold}] F1      train/test = {f1_tr:.4f} / {f1_te:.4f}")
+        enc_tag = f"{args.encoder.upper()}(hidden={args.hidden}, latent={args.latent}, layers={args.lstm_layers if args.encoder=='lstm' else 'NA'}, bidir={args.lstm_bidir if args.encoder=='lstm' else 'NA'})"
+        print(f"[FOLD {fold}] Encoder = {enc_tag}")
 
         # 저장
         fold_report = {
             "fold": fold,
+            "encoder": enc_tag,
             "train": {"roc_auc": roc_tr, "pr_auc": pr_tr, "f1": f1_tr, "report": rep_tr},
             "test":  {"roc_auc": roc_te, "pr_auc": pr_te, "f1": f1_te, "report": rep_te},
         }
@@ -651,15 +727,15 @@ def run(args: Args):
             X_latent_te=Zte, y_true_te=y_te, dae_pred_te=(p_te>=0.5).astype(int),
             out_tr=figs_dir/"train_latent_pca_boundary.png",
             out_te=figs_dir/"test_latent_pca_boundary.png",
-            title_tr=f"Fold {fold} — Train Latent (PCA+Std) + boundary",
-            title_te=f"Fold {fold} — Test Latent (PCA+Std) + boundary",
+            title_tr=f"Fold {fold} — Train Latent (PCA+Std) + boundary [{args.encoder}]",
+            title_te=f"Fold {fold} — Test Latent (PCA+Std) + boundary [{args.encoder}]",
             boundary_mode=args.boundary_mode, svm_c=args.svm_c, svm_gamma=svm_gamma_final
         )
 
         _plot_confusion(y_tr.astype(int), (p_tr>=0.5).astype(int), figs_dir/"train_confusion_dae.png",
-                        f"Fold {fold} — Train Confusion (DAE)")
+                        f"Fold {fold} — Train Confusion (DAE) [{args.encoder}]")
         _plot_confusion(y_te.astype(int), (p_te>=0.5).astype(int), figs_dir/"test_confusion_dae.png",
-                        f"Fold {fold} — Test Confusion (DAE)")
+                        f"Fold {fold} — Test Confusion (DAE) [{args.encoder}]")
 
     with open(Path(args.save_dir)/"cv_summary.json",'w') as f: json.dump(cv_reports, f, indent=2)
     print("[DONE] Global CV reports & figures saved to", args.save_dir)
@@ -680,16 +756,22 @@ if __name__ == "__main__":
     p.add_argument('--latent', type=int, default=32)
     p.add_argument('--hidden', type=int, default=64)
     p.add_argument('--device', type=str, default='cuda')
-    p.add_argument('--save_dir', type=str, default='./runs_global')
-    # curved boundary options
+    p.add_argument('--save_dir', type=str, default='./runs_global_lstm')
+    # Curved boundary options
     p.add_argument('--boundary_mode', type=str, default='rbf_svm',
                    choices=['rbf_svm','logreg','auto'],
                    help="경계 근사 방식: rbf_svm(곡선, 기본), logreg(직선), auto(가능하면 SVM)")
     p.add_argument('--svm_c', type=float, default=1.0, help='RBF-SVM C')
     p.add_argument('--svm_gamma', type=str, default='scale',
                    help="RBF-SVM gamma: 'scale'/'auto' 또는 숫자 문자열(예: '2.0')")
-    args_ns = p.parse_args()
+    # Encoder & LSTM params
+    p.add_argument('--encoder', type=str, default='lstm', choices=['lstm','conv'],
+                   help='시계열 인코더 선택 (lstm/conv)')
+    p.add_argument('--lstm_layers', type=int, default=1, help='LSTM 층 수')
+    p.add_argument('--lstm_bidir', action='store_true', help='LSTM 양방향 사용')
+    p.add_argument('--lstm_dropout', type=float, default=0.0, help='LSTM 드롭아웃(층>1일 때 유효)')
 
+    args_ns = p.parse_args()
     gamma_val: Union[str, float] = _parse_gamma(args_ns.svm_gamma)
     args = Args(
         data_root=args_ns.data_root, target_hz=args_ns.target_hz,
@@ -697,7 +779,9 @@ if __name__ == "__main__":
         epochs_ae=args_ns.epochs_ae, batch_size=args_ns.batch_size, lr=args_ns.lr,
         folds=args_ns.folds, latent=args_ns.latent, hidden=args_ns.hidden,
         device=args_ns.device, save_dir=args_ns.save_dir,
-        boundary_mode=args_ns.boundary_mode, svm_c=args_ns.svm_c, svm_gamma=gamma_val
+        boundary_mode=args_ns.boundary_mode, svm_c=args_ns.svm_c, svm_gamma=gamma_val,
+        encoder=args_ns.encoder, lstm_layers=args_ns.lstm_layers,
+        lstm_bidir=args_ns.lstm_bidir, lstm_dropout=args_ns.lstm_dropout
     )
     run(args)
 
