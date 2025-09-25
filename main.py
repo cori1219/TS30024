@@ -3,17 +3,21 @@
 
 """
 IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + 4-Fold CV
-(사람별 학습/평가 버전)
+(사람별 학습/평가 + 곡선 경계 지원 버전)
 
 주요 포인트
-- 같은 사람 판정: 파일 스템이
-  1) '123.o', '123.x'  또는
-  2) 'o_123', 'x_123'
-  일 때 모두 subject_id = '123'로 통일
+- 같은 사람 판정: zip 스템이
+  1) '123.o' / '123.x'  또는
+  2) 'o_123'  / 'x_123'
+  일 때 subject_id = '123'로 통일
 - 사람별로 데이터를 완전히 분리하여 개별 K-Fold 학습/평가
 - 작은 데이터셋에서도 학습되도록 train DataLoader의 drop_last=False
-- 경계 근사(LogReg) 대상 라벨이 단일 클래스일 때: true label로 대체 시도 → 여전히 단일이면 경계 생략
-- classification_report(zero_division=0)로 경고 억제
+- Latent PCA 2D 시각화 + **결정경계 근사**
+  - 기본: **RBF-SVM(곡선)** (`--boundary_mode rbf_svm`)
+  - 대안: LogReg(직선) (`--boundary_mode logreg`)
+  - 자동: 가능하면 SVM, 불가 시 LogReg (`--boundary_mode auto`)
+- DAE 예측 라벨이 단일 클래스일 때: true label로 대체 시도 → 여전히 단일이면 경계 생략
+- classification_report(zero_division=0)
 """
 
 import os, io, csv, re, math, json, argparse
@@ -32,6 +36,7 @@ from sklearn.metrics import classification_report, roc_auc_score, average_precis
 from sklearn.model_selection import KFold
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC  # <-- 곡선 경계용 SVM
 
 import matplotlib
 matplotlib.use("Agg")
@@ -469,43 +474,61 @@ def dae_logits_and_latent(ae: AE1D, clf_head: LatentClassifier, loader: DataLoad
         return np.array([]), np.array([]), np.zeros((0, ae.latent_dim), dtype=np.float32)
 
 
-# ------------------ Visualization ------------------
-def _plot_latent_pca_with_dae_boundary(X_latent_tr, y_true_tr, dae_pred_tr,
-                                       X_latent_te, y_true_te, dae_pred_te,
-                                       out_tr, out_te, title_tr, title_te):
+# ------------------ Visualization (PCA + curved boundary) ------------------
+def _plot_latent_pca_with_dae_boundary(
+    X_latent_tr, y_true_tr, dae_pred_tr,
+    X_latent_te, y_true_te, dae_pred_te,
+    out_tr, out_te, title_tr, title_te,
+    boundary_mode='rbf_svm', svm_c=1.0, svm_gamma='scale'
+):
     """
-    - PCA는 train latent에 맞춰 학습 → train/test 동일 변환
-    - 결정경계는 PCA 2D에서 라벨(기본: DAE 예측)을 타깃으로 하는 로지스틱 회귀로 근사
-      단, 라벨이 단일 클래스면:
-        1) 실제 라벨로 대체 시도
-        2) 그것도 단일 클래스면 경계 생략
+    PCA 2D로 잠재공간 투영 후, 지정된 방식으로 결정경계를 근사하여 그림.
+    - boundary_mode:
+        'rbf_svm' : RBF 커널 SVM (곡선 경계)
+        'logreg'  : 로지스틱 (직선 경계)
+        'auto'    : 가능하면 SVM, 예외/불가 시 로지스틱
+    - 라벨 선택: 기본 DAE 예측 → 단일 클래스면 true label 대체 → 여전히 단일이면 경계 생략
     """
     if X_latent_tr.shape[0] == 0:
         return
 
+    # 1) PCA 투영
     pca = PCA(n_components=2, random_state=42)
     Ztr = pca.fit_transform(X_latent_tr)
     Zte = pca.transform(X_latent_te) if X_latent_te.shape[0] else np.zeros((0, 2))
 
-    # --- 경계 학습용 라벨 선택 ---
-    lab_tr = dae_pred_tr.astype(int)
-    boundary_source = "dae"
+    # 2) 경계 학습용 라벨
+    lab_tr = dae_pred_tr.astype(int); source = "DAE"
     if np.unique(lab_tr).size < 2:
         if np.unique(y_true_tr.astype(int)).size >= 2:
-            lab_tr = y_true_tr.astype(int)
-            boundary_source = "true"
+            lab_tr = y_true_tr.astype(int); source = "TRUE"
         else:
-            lab_tr = None
-            boundary_source = None
+            lab_tr = None  # 경계 생략
 
-    proxy = None
+    # 3) 분류기 선택/학습
+    clf = None; tag = None
     if lab_tr is not None:
-        try:
-            proxy = LogisticRegression(class_weight='balanced', max_iter=200)
-            proxy.fit(Ztr, lab_tr)
-        except Exception:
-            proxy = None
+        mode = boundary_mode
+        if mode == 'auto':
+            try:
+                clf = SVC(kernel='rbf', C=svm_c, gamma=svm_gamma, class_weight='balanced')
+                clf.fit(Ztr, lab_tr); tag = f"SVM({source})"
+            except Exception:
+                mode = 'logreg'
+        if mode == 'rbf_svm' and clf is None:
+            try:
+                clf = SVC(kernel='rbf', C=svm_c, gamma=svm_gamma, class_weight='balanced')
+                clf.fit(Ztr, lab_tr); tag = f"SVM({source})"
+            except Exception:
+                clf = None
+        if mode == 'logreg' and clf is None:
+            try:
+                clf = LogisticRegression(class_weight='balanced', max_iter=200)
+                clf.fit(Ztr, lab_tr); tag = f"LogReg({source})"
+            except Exception:
+                clf = None
 
+    # 4) 그림
     def plot_one(Z, y_true, fname, title):
         if Z.shape[0] == 0:
             return
@@ -514,34 +537,23 @@ def _plot_latent_pca_with_dae_boundary(X_latent_tr, y_true_tr, dae_pred_tr,
         plt.scatter(Z[idx0, 0], Z[idx0, 1], s=12, label='normal (true)')
         plt.scatter(Z[idx1, 0], Z[idx1, 1], s=12, label='abnormal (true)')
 
-        if proxy is not None:
+        if clf is not None:
             x_min, x_max = np.percentile(Z[:, 0], 1), np.percentile(Z[:, 0], 99)
             y_min, y_max = np.percentile(Z[:, 1], 1), np.percentile(Z[:, 1], 99)
             xx, yy = np.meshgrid(np.linspace(x_min, x_max, 300),
                                  np.linspace(y_min, y_max, 300))
             grid = np.c_[xx.ravel(), yy.ravel()]
-            zz = proxy.decision_function(grid).reshape(xx.shape)
+            # SVM/LogReg 둘 다 decision_function 제공
+            zz = clf.decision_function(grid).reshape(xx.shape)
             cs = plt.contour(xx, yy, zz, levels=[0.0])
-            if cs.collections:
-                tag = "DAE" if boundary_source == "dae" else ("TRUE" if boundary_source == "true" else "N/A")
-                cs.collections[0].set_label(f'{tag} decision boundary')
+            if cs.collections and tag:
+                cs.collections[0].set_label(f'{tag} boundary')
 
         plt.title(title); plt.legend(); plt.tight_layout()
         plt.savefig(fname, dpi=150); plt.close()
 
     plot_one(Ztr, y_true_tr, out_tr, title_tr)
     plot_one(Zte, y_true_te, out_te, title_te)
-
-def _plot_confusion(y_true, y_pred, outpath, title):
-    if y_true.size==0 or y_pred.size==0: return
-    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
-    plt.figure(); plt.imshow(cm, interpolation='nearest'); plt.title(title)
-    plt.xticks([0,1], ['normal','abnormal']); plt.yticks([0,1], ['normal','abnormal'])
-    for i in range(2):
-        for j in range(2):
-            plt.text(j,i,str(cm[i,j]), ha='center', va='center')
-    plt.xlabel('Predicted (DAE)'); plt.ylabel('True'); plt.tight_layout()
-    plt.savefig(outpath, dpi=150); plt.close()
 
 
 # ------------------ Main CV pipeline (Per Subject) ------------------
@@ -560,6 +572,10 @@ class Args:
     hidden: int
     device: str
     save_dir: str
+    # --- boundary options ---
+    boundary_mode: str   # 'rbf_svm' | 'logreg' | 'auto'
+    svm_c: float
+    svm_gamma: str       # 'scale' | 'auto'
 
 def run(args: Args):
     set_seed(42)
@@ -661,8 +677,9 @@ def run(args: Args):
                 X_latent_te=Zte, y_true_te=y_te, dae_pred_te=(p_te>=0.5).astype(int),
                 out_tr=figs_dir/"train_latent_pca_boundary.png",
                 out_te=figs_dir/"test_latent_pca_boundary.png",
-                title_tr=f"Subject {sid} — Fold {fold} — Train Latent (PCA) + DAE boundary",
-                title_te=f"Subject {sid} — Fold {fold} — Test Latent (PCA) + DAE boundary"
+                title_tr=f"Subject {sid} — Fold {fold} — Train Latent (PCA) + boundary",
+                title_te=f"Subject {sid} — Fold {fold} — Test Latent (PCA) + boundary",
+                boundary_mode=args.boundary_mode, svm_c=args.svm_c, svm_gamma=args.svm_gamma
             )
 
             _plot_confusion(y_tr.astype(int), (p_tr>=0.5).astype(int), figs_dir/"train_confusion_dae.png",
@@ -695,6 +712,12 @@ if __name__ == "__main__":
     p.add_argument('--hidden', type=int, default=64)
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--save_dir', type=str, default='./runs')
+    # --- curved boundary options ---
+    p.add_argument('--boundary_mode', type=str, default='rbf_svm',
+                   choices=['rbf_svm','logreg','auto'],
+                   help="경계 근사 방식: rbf_svm(곡선, 기본), logreg(직선), auto(가능하면 SVM)")
+    p.add_argument('--svm_c', type=float, default=1.0, help='RBF-SVM C')
+    p.add_argument('--svm_gamma', type=str, default='scale', choices=['scale','auto'], help='RBF-SVM gamma')
     args_ns = p.parse_args()
     run(Args(**vars(args_ns)))
 

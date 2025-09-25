@@ -127,24 +127,26 @@ python main.py \
 
 ## Update Log
 
+**v0.0.3 — 2025-09-25**
+- **Added**
+  - 곡선 경계 지원: **RBF-SVM** 기반 결정경계 근사(PCA 2D 상) 추가.
+  - CLI 옵션: `--boundary_mode {rbf_svm|logreg|auto}`, `--svm_c`, `--svm_gamma`.
+- **Changed**
+  - 시각화 타이틀/범례에 경계 타입 표기(`SVM(DAE)`, `SVM(TRUE)`, `LogReg(DAE)` 등).
+- **Fixed**
+  - 경계 학습 라벨이 단일 클래스일 때도 SVM/LogReg가 안전하게 폴백하도록 처리(DAE→TRUE→경계 생략 순).
+
 **v0.0.2 — 2025-09-25**
 - **Added**
-  - 사람별 학습 파이프라인: zip 스템에서 subject 추출하여(패턴 `o_n`/`x_n`) **동일인 묶음** 후 주체별 K-Fold CV 수행.
-  - 결과 구조 개선: `runs/subject_{ID}/fold{K}_report.json`, `fold{K}_ckpt.pt`, `figs_fold{K}/*` 및 전체 요약 `all_subjects_summary.json` 저장.
-  - Latent smoothing 유지(Kalman), Latent PCA 2D 시각화 + **의사 결정경계**(로지스틱) 생성.
-
+  - 사람별 학습 파이프라인: zip 스템에서 subject 추출(패턴 `o_n`/`x_n`) 후 주체별 K-Fold CV.
+  - 결과 구조: `runs/subject_{ID}/fold{K}_report.json`, `fold{K}_ckpt.pt`, `figs_fold{K}/*`, `all_subjects_summary.json`.
+  - Latent smoothing(Kalman), PCA 2D + 로지스틱 경계 근사.
 - **Changed**
-  - 학습 데이터로더 `drop_last=False` (소량 데이터에서도 배치가 사라지지 않도록).
-  - 모델 `AE1D`에 `latent_dim` 보관 → 빈 로더/빈 배치 시에도 안전한 반환.
-
+  - 학습 DataLoader `drop_last=False`.
+  - `AE1D`에 `latent_dim` 보관.
 - **Fixed**
-  - 결정경계 학습 라벨이 단일 클래스일 때 `LogisticRegression` 예외 발생 문제:
-    - 우선 **DAE 예측**을 사용, 단일 클래스면 **실제 라벨**로 대체 시도, 그것도 단일이면 **경계 생략** 후 산점도만 저장.
-  - `classification_report`에서 클래스 부재 시 경고 발생 → `zero_division=0`로 안전 처리.
-  - 파일명 규칙 보강: `o_1.zip`/`x_1.zip`처럼 접두형 패턴도 동일인으로 인식.
-
-- **Notes**
-  - 데이터 폴더 구조는 동일(`data_root/o/*.zip`, `data_root/x/*.zip`).
-  - 실패한 CSV 헤더/앞부분은 `runs/failed_samples/*.head.txt`로 덤프.
+  - 단일 클래스 라벨 시 LogReg 예외 → TRUE 라벨 대체/경계 생략.
+  - `classification_report(..., zero_division=0)`로 경고 억제.
 
 **v0.0.1:** First version
+
