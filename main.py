@@ -3,21 +3,9 @@
 
 """
 IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + 4-Fold CV
-(사람별 학습/평가 + 곡선 경계 지원 버전)
-
-주요 포인트
-- 같은 사람 판정: zip 스템이
-  1) '123.o' / '123.x'  또는
-  2) 'o_123'  / 'x_123'
-  일 때 subject_id = '123'로 통일
-- 사람별로 데이터를 완전히 분리하여 개별 K-Fold 학습/평가
-- 작은 데이터셋에서도 학습되도록 train DataLoader의 drop_last=False
-- Latent PCA 2D 시각화 + **결정경계 근사**
-  - 기본: **RBF-SVM(곡선)** (`--boundary_mode rbf_svm`)
-  - 대안: LogReg(직선) (`--boundary_mode logreg`)
-  - 자동: 가능하면 SVM, 불가 시 LogReg (`--boundary_mode auto`)
-- DAE 예측 라벨이 단일 클래스일 때: true label로 대체 시도 → 여전히 단일이면 경계 생략
-- classification_report(zero_division=0)
+사람별 학습 + PCA 2D 시각화 + SVM 곡선 경계
+- 같은 사람: zip 스템이 `n.o`/`n.x` 또는 `o_n`/`x_n`일 때 subject=n
+- 사람별로 K-Fold CV 수행
 """
 
 import os, io, csv, re, math, json, argparse
@@ -36,7 +24,7 @@ from sklearn.metrics import classification_report, roc_auc_score, average_precis
 from sklearn.model_selection import KFold
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC  # <-- 곡선 경계용 SVM
+from sklearn.svm import SVC
 
 import matplotlib
 matplotlib.use("Agg")
@@ -105,52 +93,22 @@ def _dump_head(raw_bytes: bytes, zip_name: str, inner_name: str):
 def _read_csv_robust(raw_bytes: bytes) -> Optional[pd.DataFrame]:
     raw_bytes = raw_bytes.replace(b"\x00", b"")
     encodings = ['utf-8','utf-8-sig','cp949','euc-kr','utf-16','utf-16le','utf-16be','latin-1']
-    decimals = ['.', ',']; seps = [',','\t',';','|']
 
     def try_decode(enc):
         try: return raw_bytes.decode(enc)
         except: return None
+
     def try_pd(txt, **kw):
         return pd.read_csv(io.StringIO(txt), engine='python', on_bad_lines='skip', **kw)
 
+    # 1) 자동 구분자+소수점 추정 시도
     for enc in encodings:
         txt = try_decode(enc)
         if txt is None: continue
-        for dec in decimals:
-            try: return try_pd(txt, sep=None, decimal=dec)
-            except: pass
+        try: return try_pd(txt)
+        except: pass
 
-    def find_header_line(text):
-        lines = text.splitlines()
-        for i, line in enumerate(lines[:300]):
-            low = line.lower()
-            if ('x' in low and 'y' in low and 'z' in low) and ('time' in low or 'timestamp' in low or 'seconds_elapsed' in low):
-                return i
-        return None
-
-    for enc in encodings:
-        txt = try_decode(enc); 
-        if txt is None: continue
-        hdr = find_header_line(txt)
-        try:
-            sample = "\n".join([ln for ln in txt.splitlines() if ln.strip()][:80])
-            sniff_sep = csv.Sniffer().sniff(sample, delimiters=",".join(seps)).delimiter
-        except: sniff_sep = None
-        for dec in decimals:
-            if hdr is not None:
-                for sep in [sniff_sep] + [s for s in seps if s and s != sniff_sep]:
-                    try: return try_pd(txt, sep=sep if sep else None, decimal=dec, skiprows=hdr)
-                    except: pass
-            for sep in ([sniff_sep] if sniff_sep else []) + seps:
-                try: return try_pd(txt, sep=sep, decimal=dec)
-                except: pass
-
-    for enc in encodings:
-        txt = try_decode(enc); 
-        if txt is None: continue
-        for dec in decimals:
-            try: return try_pd(txt, header=None, decimal=dec)
-            except: pass
+    # 실패 시 None
     return None
 
 
@@ -168,10 +126,6 @@ def _parse_sensor_csv(raw_bytes: bytes, zip_name: str, inner_name: str) -> Optio
         _dump_head(raw_bytes, zip_name, inner_name); return None
 
     df.columns = [str(c).strip().lower() for c in df.columns]
-    cols_low = df.columns.tolist()
-
-    if len(cols_low) >= 5 and cols_low[:5] == ['time','seconds_elapsed','z','y','x']:
-        df.columns = ['time','seconds_elapsed','z','y','x'] + [f'extra_{i}' for i in range(len(df.columns)-5)]
 
     tcol = None
     for cand in ['timestamp','time','datetime']:
@@ -184,10 +138,8 @@ def _parse_sensor_csv(raw_bytes: bytes, zip_name: str, inner_name: str) -> Optio
         _dump_head(raw_bytes, zip_name, inner_name); return None
 
     def find_axis(cols, key):
-        if key in cols: return key
-        pat = re.compile(rf'(^|[^a-z]){key}([^a-z]|$)')
         for c in cols:
-            if pat.search(c): return c
+            if re.search(rf'(^|[^a-z]){key}([^a-z]|$)', c): return c
         return None
 
     cx = find_axis(df.columns, 'x'); cy = find_axis(df.columns, 'y'); cz = find_axis(df.columns, 'z')
@@ -263,15 +215,18 @@ def collate_fn(batch):
 
 def build_windows_from_series(df: pd.DataFrame, win_sec: int, stride_sec: int, label: int,
                               target_hz: int, group: str, subject: str, trim_sec: int = 5):
+    # 채널 정리
     for c in SENSOR_COLS:
         if c not in df.columns: df[c] = np.nan
         df[c] = pd.to_numeric(df[c], errors='coerce')
     df = df.dropna(subset=SENSOR_COLS)
     if df.empty: return []
+    # 앞뒤 trim
     if trim_sec and trim_sec > 0:
         n_trim = trim_sec * target_hz
         if len(df) > n_trim * 2: df = df.iloc[n_trim:-n_trim]
         else: return []
+
     arr = df[SENSOR_COLS].to_numpy(dtype=np.float32)
     win_len = win_sec * target_hz; stride = stride_sec * target_hz
     ws = window_stack(arr, win_len, stride)
@@ -348,7 +303,7 @@ class Decoder1D(nn.Module):
 class AE1D(nn.Module):
     def __init__(self, in_ch=6, hidden=64, latent=32):
         super().__init__()
-        self.latent_dim = latent  # 빈 케이스 대비 보관
+        self.latent_dim = latent
         self.enc = Encoder1D(in_ch, hidden, latent)
         self.dec = Decoder1D(latent, hidden, in_ch)
     def forward(self, x):
@@ -474,7 +429,7 @@ def dae_logits_and_latent(ae: AE1D, clf_head: LatentClassifier, loader: DataLoad
         return np.array([]), np.array([]), np.zeros((0, ae.latent_dim), dtype=np.float32)
 
 
-# ------------------ Visualization (PCA + curved boundary) ------------------
+# ------------------ Visualization: PCA 2D + Curved Boundary ------------------
 def _plot_latent_pca_with_dae_boundary(
     X_latent_tr, y_true_tr, dae_pred_tr,
     X_latent_te, y_true_te, dae_pred_te,
@@ -543,7 +498,7 @@ def _plot_latent_pca_with_dae_boundary(
             xx, yy = np.meshgrid(np.linspace(x_min, x_max, 300),
                                  np.linspace(y_min, y_max, 300))
             grid = np.c_[xx.ravel(), yy.ravel()]
-            # SVM/LogReg 둘 다 decision_function 제공
+            # margin (decision_function) 사용
             zz = clf.decision_function(grid).reshape(xx.shape)
             cs = plt.contour(xx, yy, zz, levels=[0.0])
             if cs.collections and tag:
@@ -556,7 +511,30 @@ def _plot_latent_pca_with_dae_boundary(
     plot_one(Zte, y_true_te, out_te, title_te)
 
 
-# ------------------ Main CV pipeline (Per Subject) ------------------
+# ------------------ Confusion matrix plot ------------------
+def _plot_confusion(y_true, y_pred, outpath, title):
+    if y_true.size == 0 or y_pred.size == 0:
+        return
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+
+    plt.figure()
+    plt.imshow(cm, interpolation='nearest')
+    plt.title(title)
+    plt.xticks([0, 1], ['normal', 'abnormal'])
+    plt.yticks([0, 1], ['normal', 'abnormal'])
+
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, str(cm[i, j]), ha='center', va='center')
+
+    plt.xlabel('Predicted (DAE)')
+    plt.ylabel('True')
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
+
+
+# ------------------ Args ------------------
 @dataclass
 class Args:
     data_root: str
@@ -572,11 +550,12 @@ class Args:
     hidden: int
     device: str
     save_dir: str
-    # --- boundary options ---
     boundary_mode: str   # 'rbf_svm' | 'logreg' | 'auto'
     svm_c: float
     svm_gamma: str       # 'scale' | 'auto'
 
+
+# ------------------ Run (Per Subject CV) ------------------
 def run(args: Args):
     set_seed(42)
     device = args.device if torch.cuda.is_available() and args.device.startswith('cuda') else 'cpu'
