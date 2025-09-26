@@ -195,6 +195,21 @@ python main.py \
 
 ## Update Log
 
+**v0.3.0 — 2025-09-26**  
+- **Added**  
+  - **TSMixer 인코더**(`--encoder tsmixer`) 추가: All-MLP 기반 토큰/채널 믹싱으로 시계열 표현력 확장.  
+  - 하이퍼파라미터: `--tsm_depth`, `--tsm_token_ratio`, `--tsm_channel_ratio`, `--tsm_dropout`.  
+- **Changed**  
+  - 기본 풀링을 **Dot-Attention**(`--attn_pool dot`)으로 유지하며 TSMixer와 호환성 점검.  
+  - Fold별 채널 표준화 경로 정리(학습 통계로 fit → train/val 동일 적용).  
+- **Fixed**  
+  - **TSMixer Token-Mixing LayerNorm 축 오류** 수정: 시간축(T)에 대해 LN을 적용하도록 변경(런타임 shape 에러 해결).  
+  - 경계 시각화(히트맵 + 0-레벨 컨투어) 안정화.  
+- **Recommendation**  
+  - 빠른/안정 베이스라인: **v0.0.x** (Conv1D DAE + 전통 경계 근사)  
+  - 글로벌 정규화 + 곡선 경계 실험: **v0.2.x** (RBF-SVM, 표준화 파이프라인)  
+  - 본 버전(**v0.3.0**)은 **TSMixer 탐색** 중심의 실험 릴리스입니다.
+
 **v0.2.0 — 2025-09-26**  
 - **Added**  
   - **TimeMixer 인코더**(`--encoder timemixer`) 도입: MLP-Mixer 스타일 블록으로 시계열 패턴 병렬 학습.  
@@ -255,5 +270,4 @@ python main.py \
 - **Fixed** 단일 클래스/리포트 경고 대응.
 
 **v0.0.1:** First version
-
 
