@@ -170,7 +170,7 @@ python main.py \
   --tsm_depth 4 --tsm_token_ratio 2.0 --tsm_channel_ratio 2.0 --tsm_dropout 0.1 \
   --attn_pool dot --attn_dropout 0.1 \
   --boundary_mode rbf_svm --svm_c 2.0 --svm_gamma scale \
-  --save_dir ./runs_tsmixer
+  --save_dir ./runs
 ```
 
 ------------------------------------------------------------------------
