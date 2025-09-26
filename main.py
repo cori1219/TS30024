@@ -4,10 +4,8 @@
 """
 IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Kalman + K-Fold CV
 Global 학습 + 채널 표준화 + PCA 2D 시각화 + 곡선 경계(RBF-SVM/LogReg)
-Encoders: Conv1D / LSTM / TimeMixer
+Encoders: Conv1D / LSTM / TimeMixer / TSMixer
 Pooling: mean / Attention(dot) / Multi-Head Attention(MHA)
-
-주의: canvas 미사용. 단일 파일 실행.
 """
 
 import os, io, csv, re, math, json, argparse
@@ -376,47 +374,28 @@ class AELSTM(nn.Module):
 
 # ===== TimeMixer Encoder =====
 class MixerBlock(nn.Module):
-    """
-    Token-Mixing(시간축) = depthwise temporal conv
-    Channel-Mixing(채널축) = 1x1 conv MLP
-    입력/출력: [B, D, T]
-    """
     def __init__(self, dim, token_kernel=7, ch_hidden=128, dropout=0.0):
         super().__init__()
         pad = token_kernel // 2
-        # Token mixing (along T): depthwise + pw conv
         self.token_norm = nn.LayerNorm(dim)
         self.token_dw = nn.Conv1d(dim, dim, kernel_size=token_kernel, padding=pad, groups=dim)
         self.token_pw = nn.Conv1d(dim, dim, kernel_size=1)
         self.token_dropout = nn.Dropout(dropout)
-
-        # Channel mixing (along D): 1x1 conv MLP
         self.ch_norm = nn.LayerNorm(dim)
         self.ch_mlp = nn.Sequential(
             nn.Conv1d(dim, ch_hidden, 1), nn.GELU(), nn.Dropout(dropout),
             nn.Conv1d(ch_hidden, dim, 1), nn.Dropout(dropout),
         )
-
     def forward(self, x):  # x: [B, D, T]
-        # token-mix
-        xt = x.transpose(1,2)                        # [B,T,D] for LN
-        xt = self.token_norm(xt).transpose(1,2)      # [B,D,T]
-        t = self.token_dw(xt)
-        t = self.token_pw(t)
-        t = self.token_dropout(t)
+        xt = x.transpose(1,2)
+        xt = self.token_norm(xt).transpose(1,2)
+        t = self.token_dw(xt); t = self.token_pw(t); t = self.token_dropout(t)
         x = x + t
-
-        # channel-mix
-        xc = x.transpose(1,2)                        # [B,T,D]
-        xc = self.ch_norm(xc).transpose(1,2)         # [B,D,T]
-        c = self.ch_mlp(xc)
-        x = x + c
+        xc = x.transpose(1,2); xc = self.ch_norm(xc).transpose(1,2)
+        c = self.ch_mlp(xc); x = x + c
         return x
 
 class EncoderTimeMixer(nn.Module):
-    """
-    입력: [B, C, T]  -> proj -> [B, D, T] -> N x MixerBlock -> [B, D, T]
-    """
     def __init__(self, in_ch=6, latent=32, depth=4, token_kernel=7, ch_hidden=128, dropout=0.0):
         super().__init__()
         self.proj = nn.Conv1d(in_ch, latent, kernel_size=1)
@@ -425,36 +404,102 @@ class EncoderTimeMixer(nn.Module):
             for _ in range(depth)
         ])
         self.norm_out = nn.BatchNorm1d(latent)
-
-    def forward(self, x):         # [B,C,T]
-        z = self.proj(x)          # [B,D,T]
-        for blk in self.blocks:
-            z = blk(z)            # [B,D,T]
-        return self.norm_out(z)   # [B,D,T]
+    def forward(self, x):
+        z = self.proj(x)
+        for blk in self.blocks: z = blk(z)
+        return self.norm_out(z)
 
 class AETIMEMIX(nn.Module):
-    """
-    AE 형태 유지: EncoderTimeMixer -> Decoder1D (기존 디코더 재사용)
-    """
     def __init__(self, in_ch=6, latent=32, depth=4, token_kernel=7, ch_hidden=128, dropout=0.0, hidden=64):
         super().__init__()
         self.latent_dim = latent
         self.enc = EncoderTimeMixer(in_ch=in_ch, latent=latent, depth=depth,
                                     token_kernel=token_kernel, ch_hidden=ch_hidden, dropout=dropout)
         self.dec = Decoder1D(latent=latent, hidden=hidden, out_ch=in_ch)
-
     def forward(self, x):
-        z = self.enc(x)           # [B,D,T]
-        xr = self.dec(z)          # [B,C,T]
-        return xr, z
+        z = self.enc(x); xr = self.dec(z); return xr, z
+    def pooled_latent(self, z): return z.mean(dim=-1)
 
-    def pooled_latent(self, z):
-        return z.mean(dim=-1)     # fallback (Attention Pooling 쓰면 pooler가 대체)
+# ===== TSMixer Encoder (All-MLP for Time Series) =====
+class FeedForward(nn.Module):
+    def __init__(self, dim_in, dim_hidden, dim_out, dropout=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim_in, dim_hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(dim_hidden, dim_out), nn.Dropout(dropout),
+        )
+    def forward(self, x): return self.net(x)
+
+class TSMixerBlock(nn.Module):
+    """
+    입력 z: [B, D, T]
+    - Token Mixing: 시간축(T) MLP (채널별 독립)
+    - Channel Mixing: 채널축(D) MLP (시점별 독립)
+    """
+    def __init__(self, dim, token_hidden_ratio=2.0, channel_hidden_ratio=2.0, dropout=0.0):
+        super().__init__()
+        self.token_hidden_ratio = token_hidden_ratio
+        self.dropout = nn.Dropout(dropout)
+        self.ln_channel = nn.LayerNorm(dim)
+        ch_hidden = int(channel_hidden_ratio * dim)
+        self.channel_mlp = nn.Sequential(
+            nn.Linear(dim, ch_hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(ch_hidden, dim), nn.Dropout(dropout),
+        )
+
+    def _token_mlp(self, x):            # x: [B, D, T]
+        B, D, T = x.shape
+        # ✅ LN over T (마지막 축이 T이므로 transpose 불필요)
+        xt = nn.functional.layer_norm(x, (T,))   # [B, D, T]
+        h = max(1, int(self.token_hidden_ratio * T))
+        ff = FeedForward(T, h, T, dropout=self.dropout.p if hasattr(self.dropout, "p") else 0.0).to(x.device)
+        y = xt.reshape(B*D, T)
+        y = ff(y).reshape(B, D, T)
+        return y
+
+    def forward(self, z):               # [B, D, T]
+        z = z + self._token_mlp(z)
+        x = z.transpose(1, 2)           # [B, T, D]
+        x = self.ln_channel(x)
+        x = self.channel_mlp(x)         # [B, T, D]
+        x = x.transpose(1, 2)           # [B, D, T]
+        z = z + x
+        return z
+
+class EncoderTSMixer(nn.Module):
+    def __init__(self, in_ch=6, latent=32, depth=4, token_hidden_ratio=2.0,
+                 channel_hidden_ratio=2.0, dropout=0.0):
+        super().__init__()
+        self.proj = nn.Conv1d(in_ch, latent, kernel_size=1)
+        self.blocks = nn.ModuleList([
+            TSMixerBlock(dim=latent, token_hidden_ratio=token_hidden_ratio,
+                         channel_hidden_ratio=channel_hidden_ratio, dropout=dropout)
+            for _ in range(depth)
+        ])
+        self.norm_out = nn.BatchNorm1d(latent)
+    def forward(self, x):
+        z = self.proj(x)
+        for blk in self.blocks: z = blk(z)
+        return self.norm_out(z)
+
+class AETSMIX(nn.Module):
+    def __init__(self, in_ch=6, latent=32, depth=4,
+                 token_hidden_ratio=2.0, channel_hidden_ratio=2.0,
+                 dropout=0.0, hidden=64):
+        super().__init__()
+        self.latent_dim = latent
+        self.enc = EncoderTSMixer(in_ch=in_ch, latent=latent, depth=depth,
+                                  token_hidden_ratio=token_hidden_ratio,
+                                  channel_hidden_ratio=channel_hidden_ratio,
+                                  dropout=dropout)
+        self.dec = Decoder1D(latent=latent, hidden=hidden, out_ch=in_ch)
+    def forward(self, x):
+        z = self.enc(x); xr = self.dec(z); return xr, z
+    def pooled_latent(self, z): return z.mean(dim=-1)
 
 
 # -------- Attention Poolers --------
 class AttnPoolDot(nn.Module):
-    """Dot-Product Temporal Attention Pooling (가벼움)"""
     def __init__(self, dim, dropout=0.0):
         super().__init__()
         self.q = nn.Parameter(torch.randn(dim))
@@ -462,15 +507,14 @@ class AttnPoolDot(nn.Module):
         self.scale = dim ** -0.5
     def forward(self, z):  # z: [B, D, T]
         B, D, T = z.shape
-        q = self.q.view(1, D, 1).expand(B, -1, -1)       # [B, D, 1]
-        scores = (z * q).sum(1) * self.scale             # [B, T]
-        w = torch.softmax(scores, dim=-1)                # [B, T]
+        q = self.q.view(1, D, 1).expand(B, -1, -1)
+        scores = (z * q).sum(1) * self.scale     # [B, T]
+        w = torch.softmax(scores, dim=-1)        # [B, T]
         w = self.dropout(w)
-        ctx = (z * w.unsqueeze(1)).sum(-1)               # [B, D]
+        ctx = (z * w.unsqueeze(1)).sum(-1)       # [B, D]
         return ctx
 
 class AttnPoolMHA(nn.Module):
-    """1-layer Multi-Head Attention + CLS token pooling"""
     def __init__(self, dim, num_heads=4, dropout=0.0):
         super().__init__()
         self.cls = nn.Parameter(torch.zeros(1, 1, dim))
@@ -486,6 +530,7 @@ class AttnPoolMHA(nn.Module):
         out = self.ln(out)
         cls_out = out[:, 0, :]               # [B,D]
         return cls_out
+
 
 # -------- Heads & Loss --------
 class ProjectionHead(nn.Module):
@@ -548,7 +593,7 @@ def train_discriminative_ae(
             xb = xb.to(device); yb = yb.to(device)
             opt.zero_grad()
             xr, z = ae(xb)                 # z:[B,D,T]
-            z_pool = pooler(z)             # [B,D]  (Attention / mean)
+            z_pool = pooler(z)             # [B,D]
             logits = clf_head(z_pool)      # [B]
             z_proj = proj_head(z_pool)
 
@@ -674,6 +719,7 @@ class Args:
     encoder: str; lstm_layers: int; lstm_bidir: bool; lstm_dropout: float
     attn_pool: str; attn_heads: int; attn_dropout: float
     tm_depth: int; tm_kernel: int; tm_ch_hidden: int; tm_dropout: float
+    tsm_depth: int; tsm_token_ratio: float; tsm_channel_ratio: float; tsm_dropout: float
 
 def _parse_gamma(g: str) -> Union[str,float]:
     try: return float(g)
@@ -711,6 +757,13 @@ def run(args: Args):
                            depth=args.tm_depth, token_kernel=args.tm_kernel,
                            ch_hidden=args.tm_ch_hidden, dropout=args.tm_dropout,
                            hidden=args.hidden).to(device)
+        elif args.encoder == 'tsmixer':
+            ae = AETSMIX(in_ch=len(SENSOR_COLS), latent=args.latent,
+                         depth=args.tsm_depth,
+                         token_hidden_ratio=args.tsm_token_ratio,
+                         channel_hidden_ratio=args.tsm_channel_ratio,
+                         dropout=args.tsm_dropout,
+                         hidden=args.hidden).to(device)
         else:
             ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
 
@@ -770,11 +823,11 @@ def run(args: Args):
             "train": {"roc_auc": roc_tr, "pr_auc": pr_tr, "f1": f1_tr, "report": rep_tr},
             "test":  {"roc_auc": roc_te, "pr_auc": pr_te, "f1": f1_te, "report": rep_te},
         }
-        cv_reports.append(fold_report)
         with open(Path(args.save_dir)/f"fold{fold}_report.json",'w') as f: json.dump(fold_report, f, indent=2)
         torch.save({"ae": ae.state_dict(), "clf_head": clf_head.state_dict(),
                     "proj_head": proj_head.state_dict(), "pooler": pooler.state_dict()},
                    Path(args.save_dir)/f"fold{fold}_ckpt.pt")
+        cv_reports.append(fold_report)
 
         # --- 시각화 ---
         figs_dir = Path(args.save_dir)/f"figs_fold{fold}"
@@ -814,7 +867,7 @@ if __name__ == "__main__":
     p.add_argument('--latent', type=int, default=32)
     p.add_argument('--hidden', type=int, default=64)
     p.add_argument('--device', type=str, default='cuda')
-    p.add_argument('--save_dir', type=str, default='./runs_timemixer')
+    p.add_argument('--save_dir', type=str, default='./runs')
 
     # Boundary
     p.add_argument('--boundary_mode', type=str, default='rbf_svm', choices=['rbf_svm','logreg'])
@@ -822,7 +875,7 @@ if __name__ == "__main__":
     p.add_argument('--svm_gamma', type=str, default='scale')
 
     # Encoder 선택
-    p.add_argument('--encoder', type=str, default='timemixer', choices=['lstm','conv','timemixer'])
+    p.add_argument('--encoder', type=str, default='tsmixer', choices=['lstm','conv','timemixer','tsmixer'])
 
     # LSTM 전용
     p.add_argument('--lstm_layers', type=int, default=1)
@@ -835,6 +888,12 @@ if __name__ == "__main__":
     p.add_argument('--tm_ch_hidden', type=int, default=128)
     p.add_argument('--tm_dropout', type=float, default=0.0)
 
+    # TSMixer 전용
+    p.add_argument('--tsm_depth', type=int, default=4)
+    p.add_argument('--tsm_token_ratio', type=float, default=2.0)
+    p.add_argument('--tsm_channel_ratio', type=float, default=2.0)
+    p.add_argument('--tsm_dropout', type=float, default=0.0)
+
     # Attention Pooling
     p.add_argument('--attn_pool', type=str, default='dot', choices=['none','dot','mha'],
                    help='시간축 풀링: none=mean, dot=dot-product attention, mha=multi-head attention')
@@ -842,7 +901,11 @@ if __name__ == "__main__":
     p.add_argument('--attn_dropout', type=float, default=0.0)
 
     args_ns = p.parse_args()
+    def _parse_gamma(g: str) -> Union[str,float]:
+        try: return float(g)
+        except: return g
     gamma_val = _parse_gamma(args_ns.svm_gamma)
+
     args = Args(
         data_root=args_ns.data_root, target_hz=args_ns.target_hz,
         window_sec=args_ns.window_sec, stride_sec=args_ns.stride_sec, trim_sec=args_ns.trim_sec,
@@ -854,7 +917,9 @@ if __name__ == "__main__":
         lstm_bidir=args_ns.lstm_bidir, lstm_dropout=args_ns.lstm_dropout,
         attn_pool=args_ns.attn_pool, attn_heads=args_ns.attn_heads, attn_dropout=args_ns.attn_dropout,
         tm_depth=args_ns.tm_depth, tm_kernel=args_ns.tm_kernel,
-        tm_ch_hidden=args_ns.tm_ch_hidden, tm_dropout=args_ns.tm_dropout
+        tm_ch_hidden=args_ns.tm_ch_hidden, tm_dropout=args_ns.tm_dropout,
+        tsm_depth=args_ns.tsm_depth, tsm_token_ratio=args_ns.tsm_token_ratio,
+        tsm_channel_ratio=args_ns.tsm_channel_ratio, tsm_dropout=args_ns.tsm_dropout
     )
     run(args)
 
