@@ -152,7 +152,7 @@ python main.py \
   --encoder timemixer --tm_depth 4 --tm_kernel 7 --tm_ch_hidden 128 --tm_dropout 0.1 \
   --attn_pool dot --attn_dropout 0.1 \
   --boundary_mode rbf_svm --svm_c 2.0 --svm_gamma scale \
-  --save_dir ./runs_timemixer
+  --save_dir ./runs
 ```
 
 ------------------------------------------------------------------------
@@ -176,6 +176,18 @@ python main.py \
 ------------------------------------------------------------------------
 
 ## Update Log
+
+**v0.2.0 — 2025-09-26**  
+- **Added**  
+  - **TimeMixer 인코더**(`--encoder timemixer`) 도입: MLP-Mixer 스타일 블록으로 시계열 패턴 병렬 학습.  
+  - 하이퍼파라미터: `--tm_depth`, `--tm_kernel`, `--tm_ch_hidden`, `--tm_dropout`.  
+- **Changed**  
+  - 모델 선택을 `--encoder {lstm,conv,timemixer}`로 통합(드롭인 교체).  
+  - 시각화/로그에 **Encoder + Pooling 태그** 표기(예: `TIMEMIXER + DOT`).  
+- **Fixed**  
+  - Kalman 후 텐서/디바이스 변환 안정화, 경계 근사 입력 스케일링 예외 처리 보강.  
+- **Perf/Deploy**  
+  - TimeMixer 병렬화로 학습/추론 속도 향상, TorchScript/TFLite 친화.
 
 **v0.1.1 — 2025-09-26**  
 - **Added**  
@@ -225,4 +237,5 @@ python main.py \
 - **Fixed** 단일 클래스/리포트 경고 대응.
 
 **v0.0.1:** First version
+
 
