@@ -138,6 +138,23 @@ python main.py \
   --save_dir ./runs
 ```
 
+``` bash
+# Run the model v0.2.0
+python main.py \
+  --data_root ./raw_data \
+  --target_hz 50 \
+  --window_sec 30 --stride_sec 15 \
+  --trim_sec 5 \
+  --epochs_ae 20 \
+  --batch_size 64 --lr 1e-3 \
+  --folds 4 \
+  --latent 48 --hidden 64 \
+  --encoder timemixer --tm_depth 4 --tm_kernel 7 --tm_ch_hidden 128 --tm_dropout 0.1 \
+  --attn_pool dot --attn_dropout 0.1 \
+  --boundary_mode rbf_svm --svm_c 2.0 --svm_gamma scale \
+  --save_dir ./runs_timemixer
+```
+
 ------------------------------------------------------------------------
 
 ## Tech Stack
