@@ -118,7 +118,7 @@ python main.py \
   --latent 32 --hidden 64 \
   --encoder lstm --lstm_layers 1 --lstm_bidir \
   --boundary_mode rbf_svm --svm_c 2.0 --svm_gamma scale \
-  --save_dir ./runs_lstm
+  --save_dir ./runs
 ```
 
 ``` bash
@@ -135,7 +135,7 @@ python main.py \
   --encoder lstm --lstm_layers 1 --lstm_bidir \
   --attn_pool dot --attn_dropout 0.1 \
   --boundary_mode rbf_svm --svm_c 2.0 --svm_gamma scale \
-  --save_dir ./runs_lstm_attn
+  --save_dir ./runs
 ```
 
 ------------------------------------------------------------------------
