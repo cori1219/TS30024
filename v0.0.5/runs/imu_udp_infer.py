@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-휴대폰 IMU(UDP) → PC 수신 40초 → 앞/뒤 5초 컷(=30초) → 모델 추론
-- 체크포인트: (기본) 현재 폴더의 'fold3_ckpt.pt'만 사용. 없으면 에러.
-- 분류 경로: enc(x) -> z(32,T) -> 시간평균(GAP) -> 32벡터 -> clf_head -> 로짓/확률
-- 입력 포맷: UDP로 "ax,ay,az,gx,gy,gz" 한 줄(6개 float)
+UDP IMU → 40s 수집 → 앞/뒤 5s 컷(=30s) → 균일 리샘플 → (훈련 통계) z-score → Encoder
+→ Latent Kalman smoothing → 시간평균(GAP) → MLP 분류기 → logit/prob 출력
+
+※ 두 번째 학습 스크립트의 'test' 경로와 동일한 전처리/추론 파이프라인:
+  - 채널별 정규화: 반드시 '훈련 폴드에서 추정한 mean/std'를 전달해야 함 (ax,ay,az,gx,gy,gz 순)
+  - latent 칼만 스무딩: process_var=1e-3, measure_var=1e-2
+  - 분류기: LatentClassifier(MLP)와 동일 구조(Linear 32→64→1)
 
 실행 예:
-  python imu_udp_infer.py --port 9000 --target-hz 50 --seq-norm
+  python imu_udp_infer.py --port 9000 --target-hz 50 \
+    --ckpt fold3_ckpt.pt \
+    --mean 0.01,0.00,-0.02,0.0,0.0,0.0 \
+    --std  0.98,1.02,1.01,0.95,1.03,0.99
 """
 
 import argparse
 import socket
 import time
-import math
 import sys
 from pathlib import Path
 
@@ -22,7 +27,7 @@ import torch
 import torch.nn as nn
 
 
-# ============================ 모델 정의 (체크포인트와 키 구조 일치) ============================
+# ============================ 모델 정의 (학습 스크립트와 키/구조 호환) ============================
 
 class Encoder(nn.Module):
     def __init__(self, in_ch=6):
@@ -97,6 +102,28 @@ class ClfHead(nn.Module):
         return self.net(z_vec32)  # [B,1]
 
 
+# -------- Kalman (두 번째 코드의 SimpleKalman과 동일 파라미터) --------
+class SimpleKalman:
+    def __init__(self, dim: int, process_var: float = 1e-3, measure_var: float = 1e-2):
+        self.q = process_var
+        self.r = measure_var
+
+    def filter(self, seq: np.ndarray) -> np.ndarray:
+        T, D = seq.shape
+        out = np.zeros_like(seq)
+        x = np.zeros(D, dtype=seq.dtype)
+        p = np.ones(D, dtype=seq.dtype)
+        for t in range(T):
+            x_pred = x
+            p_pred = p + self.q
+            z = seq[t]
+            k = p_pred / (p_pred + self.r)
+            x = x_pred + k * (z - x_pred)
+            p = (1 - k) * p_pred
+            out[t] = x
+        return out
+
+
 class InferenceModel(nn.Module):
     def __init__(self, ckpt_path, device="cpu"):
         super().__init__()
@@ -105,7 +132,7 @@ class InferenceModel(nn.Module):
         self.clf_head = ClfHead()
 
         ckpt = torch.load(ckpt_path, map_location="cpu")
-        # 예상 키: 'ae' (enc.*, dec.*), 'proj_head' (net.*), 'clf_head' (net.*)
+        # 예상 키: 'ae', 'proj_head', 'clf_head'
         self.ae.load_state_dict(ckpt["ae"], strict=True)
         self.proj_head.load_state_dict(ckpt["proj_head"], strict=True)
         self.clf_head.load_state_dict(ckpt["clf_head"], strict=True)
@@ -115,10 +142,19 @@ class InferenceModel(nn.Module):
         self.device = device
 
     @torch.no_grad()
-    def forward(self, x):  # x: [B,6,T]
-        z = self.ae.enc(x)                 # [B,32,T]
-        z_vec = z.mean(dim=-1)             # GAP over time -> [B,32]
-        logit = self.clf_head(z_vec)[:, 0] # [B]
+    def forward(self, x):  # x: [B,6,T], z-kalman → GAP → clf
+        z = self.ae.enc(x)  # [B,32,T]
+
+        # ===== Kalman smoothing (test 경로와 동일) =====
+        z_np = z.detach().cpu().numpy().transpose(0, 2, 1)  # [B,T,32]
+        B, T, D = z_np.shape
+        zf_np = np.zeros_like(z_np)
+        for b in range(B):
+            zf_np[b] = SimpleKalman(D, 1e-3, 1e-2).filter(z_np[b])
+        zf = torch.from_numpy(zf_np.transpose(0, 2, 1)).to(self.device)  # [B,32,T]
+
+        z_vec = zf.mean(dim=-1)              # GAP over time -> [B,32]
+        logit = self.clf_head(z_vec)[:, 0]   # [B]
         prob = torch.sigmoid(logit)
         return {"logit": logit, "prob": prob}
 
@@ -153,9 +189,9 @@ def recv_udp_40s(port: int, timeout: float = 1.0):
                 pkt, _ = sock.recvfrom(4096)
             except socket.timeout:
                 if t0 is None:
-                    continue  # 아직 시작 전이면 계속 대기
+                    continue
                 else:
-                    continue  # 창 진행 중이면 타임아웃 무시하고 재시도
+                    continue
 
             line = pkt.decode("utf-8", errors="ignore")
             for raw in line.strip().splitlines():
@@ -209,23 +245,14 @@ def trim_and_resample(times, data, target_hz: int):
 
 # ============================ 정규화 ============================
 
-def apply_norm(x_6T, mean=None, std=None, seq_norm=False, eps=1e-6):
+def apply_norm_train_stats(x_6T, mean, std, eps=1e-6):
     """
-    x_6T: (6, T)
-    - mean/std 지정 시 채널별 고정 정규화
-    - seq_norm=True 시 현재 시퀀스 통계로 z-score
-    - 둘 다 없으면 그대로 반환
+    훈련 폴드에서 추정된 채널별 mean/std로 z-score (test 경로와 동일)
+    x_6T: (6, T), mean/std: 길이 6 리스트
     """
-    x = x_6T.copy()
-    if mean is not None and std is not None:
-        m = np.asarray(mean, dtype=np.float32).reshape(6, 1)
-        s = np.asarray(std, dtype=np.float32).reshape(6, 1)
-        x = (x - m) / (s + eps)
-    elif seq_norm:
-        m = x.mean(axis=1, keepdims=True)
-        s = x.std(axis=1, keepdims=True)
-        x = (x - m) / (s + eps)
-    return x
+    m = np.asarray(mean, dtype=np.float32).reshape(6, 1)
+    s = np.asarray(std, dtype=np.float32).reshape(6, 1)
+    return ((x_6T - m) / (s + eps)).astype(np.float32)
 
 
 # ============================ 유틸: ckpt 확인 ============================
@@ -234,7 +261,7 @@ def resolve_ckpt_or_die(path_arg: str) -> str:
     p = Path(path_arg)
     if p.exists():
         return str(p)
-    print("[ERR] 'fold3_ckpt.pt' not found in current folder. Put it here or pass --ckpt PATH.")
+    print(f"[ERR] checkpoint not found: {path_arg}")
     sys.exit(2)
 
 
@@ -247,25 +274,25 @@ def main():
     ap.add_argument("--ckpt", type=str, default="fold3_ckpt.pt",
                     help="체크포인트 경로(기본: 현재 폴더의 fold3_ckpt.pt)")
     ap.add_argument("--device", type=str, default="cpu", help="cpu 또는 cuda")
-    ap.add_argument("--mean", type=str, default=None, help="채널별 평균 6개, 예: 0,0,0,0,0,0")
-    ap.add_argument("--std", type=str, default=None, help="채널별 표준편차 6개, 예: 1,1,1,1,1,1")
-    ap.add_argument("--seq-norm", action="store_true", help="시퀀스 z-score 정규화")
+
+    # test 경로 동일화를 위해 mean/std 필수
+    ap.add_argument("--mean", type=str, required=True, help="채널별 평균 6개, 예: 0,0,0,0,0,0 (ax,ay,az,gx,gy,gz)")
+    ap.add_argument("--std", type=str, required=True, help="채널별 표준편차 6개, 예: 1,1,1,1,1,1 (ax,ay,az,gx,gy,gz)")
+
     args = ap.parse_args()
 
-    # mean/std 파싱
-    mean = std = None
-    if args.mean and args.std:
-        try:
-            mean = [float(x) for x in args.mean.split(",")]
-            std = [float(x) for x in args.std.split(",")]
-            if len(mean) != 6 or len(std) != 6:
-                print("[ERR] mean/std는 6개 값이어야 함.")
-                sys.exit(2)
-        except Exception:
-            print("[ERR] mean/std 파싱 실패.")
+    # mean/std 파싱 (훈련 폴드 통계 그대로 넣어야 함)
+    try:
+        mean = [float(x) for x in args.mean.split(",")]
+        std = [float(x) for x in args.std.split(",")]
+        if len(mean) != 6 or len(std) != 6:
+            print("[ERR] mean/std는 6개 값이어야 함. 순서: ax,ay,az,gx,gy,gz")
             sys.exit(2)
+    except Exception:
+        print("[ERR] mean/std 파싱 실패. 예: --mean 0,0,0,0,0,0 --std 1,1,1,1,1,1")
+        sys.exit(2)
 
-    # 체크포인트 확인 (현재 폴더만)
+    # 체크포인트 확인
     ckpt_path = resolve_ckpt_or_die(args.ckpt)
 
     # 1) 수신(40초)
@@ -274,10 +301,14 @@ def main():
     # 2) 트리밍 + 리샘플(30초)
     x_6T, _ = trim_and_resample(times, data, args.target_hz)
 
-    # 3) 정규화
-    x_6T = apply_norm(x_6T, mean=mean, std=std, seq_norm=args.seq_norm).astype(np.float32)
+    # 3) (훈련 통계) 정규화 — test 경로와 동일
+    x_6T = apply_norm_train_stats(x_6T, mean=mean, std=std)
 
-    # 4) 모델 로드 & 추론
+    # 4) 모델 로드 & 추론 (latent Kalman 포함)
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        print("[WARN] CUDA not available. Falling back to CPU.")
+        args.device = "cpu"
+
     model = InferenceModel(ckpt_path, device=args.device)
     with torch.no_grad():
         x = torch.from_numpy(x_6T[None, ...]).to(model.device)  # [1,6,T]
@@ -286,11 +317,13 @@ def main():
         prob = out["prob"].item()
 
     # 5) 결과
-    print("=== INFERENCE RESULT (30s window) ===")
+    print("=== INFERENCE RESULT (30s window, TEST-MATCHED) ===")
     print(f"logit: {logit:.6f}")
     print(f"prob(sigmoid): {prob:.6f}")
+    print(f"label(@0.5): {1 if prob >= 0.5 else 0}")
 
 
 if __name__ == "__main__":
     main()
+
 
