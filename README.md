@@ -173,6 +173,10 @@ python main.py \
   --save_dir ./runs
 ```
 
+``` bash
+# Run the model test v0.0.5 with live data
+python imu_udp_infer.py --target-hz 50 --seq-norm
+```
 ------------------------------------------------------------------------
 
 ## Tech Stack
