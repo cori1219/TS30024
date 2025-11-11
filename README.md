@@ -91,7 +91,7 @@ pip install -r requirements.txt
 ## Usage
 
 ``` bash
-# Run the model v0.0.2 ~ v0.0.5
+# Run the model training v0.0.2 ~ v0.0.5
 python main.py \
   --data_root ./raw_data \
   --target_hz 50 \
@@ -106,7 +106,7 @@ python main.py \
 ```
 
 ``` bash
-# Run the model v0.1.0
+# Run the model training v0.1.0
 python main.py \
   --data_root ./raw_data \
   --target_hz 50 \
@@ -122,7 +122,7 @@ python main.py \
 ```
 
 ``` bash
-# Run the model v0.1.1
+# Run the model training v0.1.1
 python main.py \
   --data_root ./raw_data \
   --target_hz 50 \
@@ -139,7 +139,7 @@ python main.py \
 ```
 
 ``` bash
-# Run the model v0.2.0
+# Run the model training v0.2.0
 python main.py \
   --data_root ./raw_data \
   --target_hz 50 \
@@ -156,7 +156,7 @@ python main.py \
 ```
 
 ``` bash
-# Run the model v0.3.0
+# Run the model training v0.3.0
 python main.py \
   --data_root ./raw_data \
   --target_hz 50 \
