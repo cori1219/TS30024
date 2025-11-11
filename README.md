@@ -174,7 +174,7 @@ python main.py \
 ```
 
 ``` bash
-# Run the model test v0.0.5 with live data
+# Run the model test v0.0.5 with real-time data
 python imu_udp_infer.py --target-hz 50 --seq-norm
 ```
 ------------------------------------------------------------------------
