@@ -94,7 +94,7 @@ pip install -r requirements.txt
 # Run the model training v0.0.2 ~ v0.0.5
 python main.py \
   --data_root ./raw_data \
-  --target_hz 50 \
+  --target_hz 100 \
   --window_sec 30 --stride_sec 15 \
   --trim_sec 5 \
   --epochs_ae 20 \
@@ -109,7 +109,7 @@ python main.py \
 # Run the model training v0.1.0
 python main.py \
   --data_root ./raw_data \
-  --target_hz 50 \
+  --target_hz 100 \
   --window_sec 30 --stride_sec 15 \
   --trim_sec 5 \
   --epochs_ae 20 \
@@ -125,7 +125,7 @@ python main.py \
 # Run the model training v0.1.1
 python main.py \
   --data_root ./raw_data \
-  --target_hz 50 \
+  --target_hz 100 \
   --window_sec 30 --stride_sec 15 \
   --trim_sec 5 \
   --epochs_ae 20 \
@@ -142,7 +142,7 @@ python main.py \
 # Run the model training v0.2.0
 python main.py \
   --data_root ./raw_data \
-  --target_hz 50 \
+  --target_hz 100 \
   --window_sec 30 --stride_sec 15 \
   --trim_sec 5 \
   --epochs_ae 20 \
@@ -159,7 +159,7 @@ python main.py \
 # Run the model training v0.3.0
 python main.py \
   --data_root ./raw_data \
-  --target_hz 50 \
+  --target_hz 100 \
   --window_sec 30 --stride_sec 15 \
   --trim_sec 5 \
   --epochs_ae 20 \
@@ -175,7 +175,7 @@ python main.py \
 
 ``` bash
 # Run the model test v0.0.5 with real-time data
-python imu_udp_infer.py --target-hz 50 \
+python imu_udp_infer.py --target-hz 100 \
   --train-py ../main.py \
   --data-root ../../raw_data \
   --folds 4 --fold 3 \
