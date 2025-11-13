@@ -176,8 +176,8 @@ python main.py \
 ``` bash
 # Run the model test v0.0.5 with real-time data
 python imu_udp_infer.py --target-hz 50 \
-  --train-py ./train_global.py \
-  --data-root ./data \
+  --train-py ../main.py \
+  --data-root ../../raw_data \
   --folds 4 --fold 3 \
   --window-sec 30 --stride-sec 15 --trim-sec 5
 
