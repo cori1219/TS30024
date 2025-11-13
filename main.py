@@ -5,10 +5,6 @@
 IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + K-Fold CV
 전 피험자 합본(Global) 학습 + 훈련 통계로 채널별 표준화 + PCA 2D 시각화 + SVM/LogReg 경계
 F1-score 출력/저장 추가 (train/test)
-
-※ 수정 사항:
-- 각 fold에서 ChannelNormalizer.fit() 직후 채널별 mean/std를 저장:
-  - runs_global/fold{K}/mean.npy, std.npy, norm.json
 """
 
 import os, io, csv, re, math, json, argparse
@@ -590,18 +586,6 @@ def run(args: Args):
         # --- 채널별 표준화 통계 (train fold) ---
         ch_norm = ChannelNormalizer(); ch_norm.fit(train_items)
 
-        # ===(추가) 학습 통계 저장: mean/std/norm.json ===
-        fold_dir = Path(args.save_dir) / f"fold{fold}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        np.save(fold_dir / "mean.npy", ch_norm.mean)   # (6,)
-        np.save(fold_dir / "std.npy",  ch_norm.std)    # (6,)
-        (fold_dir / "norm.json").write_text(json.dumps({
-            "mean": ch_norm.mean.tolist(),
-            "std":  ch_norm.std.tolist(),
-            "order": ["ax","ay","az","gx","gy","gz"]
-        }, indent=2), encoding="utf-8")
-        # ============================================
-
         # --- 모델 ---
         ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
         clf_head = LatentClassifier(in_dim=args.latent, hidden=args.hidden).to(device)
@@ -653,6 +637,7 @@ def run(args: Args):
             "train": {"roc_auc": roc_tr, "pr_auc": pr_tr, "f1": f1_tr, "report": rep_tr},
             "test":  {"roc_auc": roc_te, "pr_auc": pr_te, "f1": f1_te, "report": rep_te},
         }
+        cv_reports.append(fold_report)
         with open(Path(args.save_dir)/f"fold{fold}_report.json",'w') as f: json.dump(fold_report, f, indent=2)
         torch.save({"ae": ae.state_dict(), "clf_head": clf_head.state_dict(), "proj_head": proj_head.state_dict()},
                    Path(args.save_dir)/f"fold{fold}_ckpt.pt")
