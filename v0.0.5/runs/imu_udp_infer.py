@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-UDP IMU → 40s 수집 → 앞/뒤 5s 컷(=30s) → 균일 리샘플 → (훈련 통계) z-score → Encoder
-→ Latent Kalman smoothing → 시간평균(GAP) → MLP 분류기 → logit/prob 출력
+UDP IMU → 40s 수집 → 앞/뒤 5s 컷(=30s) → 균일 리샘플 → (훈련 폴드 통계) z-score
+→ Encoder → Latent Kalman smoothing → 시간평균(GAP) → MLP 분류기 → logit/prob
 
-※ 두 번째 학습 스크립트의 'test' 경로와 동일한 전처리/추론 파이프라인:
-  - 채널별 정규화: 반드시 '훈련 폴드에서 추정한 mean/std'를 전달해야 함 (ax,ay,az,gx,gy,gz 순)
+※ 두 번째 학습 스크립트의 'test' 파이프라인과 동일:
+  - 채널별 정규화: 훈련 폴드 통계를 ckpt에서 자동 로드 (ax,ay,az,gx,gy,gz)
   - latent 칼만 스무딩: process_var=1e-3, measure_var=1e-2
-  - 분류기: LatentClassifier(MLP)와 동일 구조(Linear 32→64→1)
-
-실행 예:
-  python imu_udp_infer.py --port 9000 --target-hz 50 \
-    --ckpt fold3_ckpt.pt \
-    --mean 0.01,0.00,-0.02,0.0,0.0,0.0 \
-    --std  0.98,1.02,1.01,0.95,1.03,0.99
+  - 분류기: MLP (Linear 32→64→1), 임계값 0.5
 """
 
 import argparse
 import socket
 import time
-import sys
+import sys, json
 from pathlib import Path
 
 import numpy as np
@@ -246,21 +240,53 @@ def trim_and_resample(times, data, target_hz: int):
 # ============================ 정규화 ============================
 
 def apply_norm_train_stats(x_6T, mean, std, eps=1e-6):
-    """
-    훈련 폴드에서 추정된 채널별 mean/std로 z-score (test 경로와 동일)
-    x_6T: (6, T), mean/std: 길이 6 리스트
-    """
     m = np.asarray(mean, dtype=np.float32).reshape(6, 1)
     s = np.asarray(std, dtype=np.float32).reshape(6, 1)
     return ((x_6T - m) / (s + eps)).astype(np.float32)
 
 
+def load_norm_from_ckpt_or_sidecar(ckpt_path: Path):
+    """
+    ckpt에 'norm_mean'/'norm_std' 또는 'channel_norm':{'mean','std'}가 있으면 사용.
+    없으면 동일 경로의 '<ckpt>.norm.json'을 찾아 사용.
+    """
+    # 1) ckpt 내부
+    try:
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
+        for k_mean, k_std in [("norm_mean", "norm_std"),
+                              ("mean", "std")]:
+            if k_mean in ckpt and k_std in ckpt:
+                m = np.array(ckpt[k_mean], dtype=np.float32).tolist()
+                s = np.array(ckpt[k_std], dtype=np.float32).tolist()
+                if len(m) == 6 and len(s) == 6:
+                    return m, s, "ckpt"
+        if "channel_norm" in ckpt and isinstance(ckpt["channel_norm"], dict):
+            d = ckpt["channel_norm"]
+            if "mean" in d and "std" in d and len(d["mean"]) == 6 and len(d["std"]) == 6:
+                return list(map(float, d["mean"])), list(map(float, d["std"])), "ckpt"
+    except Exception:
+        pass
+
+    # 2) 사이드카 JSON (예: fold3_ckpt.pt.norm.json)
+    sidecar = ckpt_path.with_suffix(ckpt_path.suffix + ".norm.json")
+    if sidecar.exists():
+        try:
+            js = json.loads(sidecar.read_text(encoding="utf-8"))
+            m, s = js.get("mean"), js.get("std")
+            if m and s and len(m) == 6 and len(s) == 6:
+                return list(map(float, m)), list(map(float, s)), "json"
+        except Exception:
+            pass
+
+    return None, None, None
+
+
 # ============================ 유틸: ckpt 확인 ============================
 
-def resolve_ckpt_or_die(path_arg: str) -> str:
+def resolve_ckpt_or_die(path_arg: str) -> Path:
     p = Path(path_arg)
     if p.exists():
-        return str(p)
+        return p
     print(f"[ERR] checkpoint not found: {path_arg}")
     sys.exit(2)
 
@@ -274,50 +300,72 @@ def main():
     ap.add_argument("--ckpt", type=str, default="fold3_ckpt.pt",
                     help="체크포인트 경로(기본: 현재 폴더의 fold3_ckpt.pt)")
     ap.add_argument("--device", type=str, default="cpu", help="cpu 또는 cuda")
-
-    # test 경로 동일화를 위해 mean/std 필수
-    ap.add_argument("--mean", type=str, required=True, help="채널별 평균 6개, 예: 0,0,0,0,0,0 (ax,ay,az,gx,gy,gz)")
-    ap.add_argument("--std", type=str, required=True, help="채널별 표준편차 6개, 예: 1,1,1,1,1,1 (ax,ay,az,gx,gy,gz)")
-
+    # 수동 override 옵션(옵션): 자동 로드 실패시 사용 가능
+    ap.add_argument("--mean", type=str, default=None, help="(옵션) 채널별 평균 6개, ax,ay,az,gx,gy,gz")
+    ap.add_argument("--std",  type=str, default=None, help="(옵션) 채널별 표준편차 6개, ax,ay,az,gx,gy,gz")
+    ap.add_argument("--seq-norm", action="store_true",
+                    help="(비권장) 자동/수동 통계 없을 때 현재 시퀀스 z-score — TEST와 동일 아님")
     args = ap.parse_args()
 
-    # mean/std 파싱 (훈련 폴드 통계 그대로 넣어야 함)
-    try:
-        mean = [float(x) for x in args.mean.split(",")]
-        std = [float(x) for x in args.std.split(",")]
-        if len(mean) != 6 or len(std) != 6:
-            print("[ERR] mean/std는 6개 값이어야 함. 순서: ax,ay,az,gx,gy,gz")
-            sys.exit(2)
-    except Exception:
-        print("[ERR] mean/std 파싱 실패. 예: --mean 0,0,0,0,0,0 --std 1,1,1,1,1,1")
-        sys.exit(2)
-
-    # 체크포인트 확인
+    # ckpt 확인
     ckpt_path = resolve_ckpt_or_die(args.ckpt)
 
-    # 1) 수신(40초)
-    times, data = recv_udp_40s(args.port)
-
-    # 2) 트리밍 + 리샘플(30초)
-    x_6T, _ = trim_and_resample(times, data, args.target_hz)
-
-    # 3) (훈련 통계) 정규화 — test 경로와 동일
-    x_6T = apply_norm_train_stats(x_6T, mean=mean, std=std)
-
-    # 4) 모델 로드 & 추론 (latent Kalman 포함)
+    # 디바이스 점검
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         print("[WARN] CUDA not available. Falling back to CPU.")
         args.device = "cpu"
 
-    model = InferenceModel(ckpt_path, device=args.device)
+    # -------- 1) 수신(40초) --------
+    times, data = recv_udp_40s(args.port)
+
+    # -------- 2) 트리밍 + 리샘플(30초) --------
+    x_6T, _ = trim_and_resample(times, data, args.target_hz)
+
+    # -------- 3) 정규화 (우선순위: ckpt/sidecar 자동 → 수동 → seq-norm) --------
+    mean = std = None
+    src = None
+
+    # 3-1 자동: ckpt/sidecar에서 로드
+    m_auto, s_auto, src = load_norm_from_ckpt_or_sidecar(ckpt_path)
+    if m_auto is not None and s_auto is not None:
+        mean, std = m_auto, s_auto
+        print(f"[INFO] Using train-fold normalization from {src}: {ckpt_path.name}")
+
+    # 3-2 수동 override
+    if args.mean and args.std:
+        try:
+            mean = [float(x) for x in args.mean.split(",")]
+            std  = [float(x) for x in args.std.split(",")]
+            assert len(mean) == 6 and len(std) == 6
+            print("[INFO] Using manual normalization from CLI.")
+        except Exception:
+            print("[ERR] mean/std 파싱 실패. 예: --mean 0,0,0,0,0,0 --std 1,1,1,1,1,1")
+            sys.exit(2)
+
+    # 3-3 최종 적용
+    if mean is not None and std is not None:
+        x_6T = apply_norm_train_stats(x_6T, mean=mean, std=std)
+    elif args.seq_norm:
+        # test 동일은 아니지만, 마지막 수단
+        m = x_6T.mean(axis=1, keepdims=True)
+        s = x_6T.std(axis=1, keepdims=True)
+        x_6T = ((x_6T - m) / (s + 1e-6)).astype(np.float32)
+        print("[WARN] Falling back to seq-norm (TEST와 동일 아님).")
+    else:
+        print("[ERR] 훈련 통계를 자동으로 찾지 못했습니다. "
+              "훈련 시 ckpt에 norm_mean/norm_std를 저장하거나, --mean/--std를 지정하거나, --seq-norm을 사용하세요.")
+        sys.exit(2)
+
+    # -------- 4) 모델 로드 & 추론 (latent Kalman 포함) --------
+    model = InferenceModel(str(ckpt_path), device=args.device)
     with torch.no_grad():
         x = torch.from_numpy(x_6T[None, ...]).to(model.device)  # [1,6,T]
         out = model(x)
         logit = out["logit"].item()
         prob = out["prob"].item()
 
-    # 5) 결과
-    print("=== INFERENCE RESULT (30s window, TEST-MATCHED) ===")
+    # -------- 5) 결과 --------
+    print("=== INFERENCE RESULT (30s window, TEST-MATCHED WHEN NORM FROM CKPT) ===")
     print(f"logit: {logit:.6f}")
     print(f"prob(sigmoid): {prob:.6f}")
     print(f"label(@0.5): {1 if prob >= 0.5 else 0}")
@@ -325,5 +373,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
