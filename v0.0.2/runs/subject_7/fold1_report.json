@@ -2,8 +2,8 @@
   "subject": "7",
   "fold": 1,
   "train": {
-    "roc_auc": 1.0,
-    "pr_auc": 1.0,
+    "roc_auc": 0.9511111111111111,
+    "pr_auc": 0.9605644355644356,
     "report": {
       "0.0": {
         "precision": 0.0,
