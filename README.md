@@ -91,7 +91,21 @@ pip install -r requirements.txt
 ## Usage
 
 ``` bash
-# Run the model training v0.0.2 ~ v0.0.5
+# Run the model training v0.0.1 ~ v0.0.2
+python main.py \
+  --data_root ./raw_data \
+  --target_hz 100 \
+  --window_sec 30 --stride_sec 15 \
+  --trim_sec 5 \
+  --epochs_ae 20 \
+  --batch_size 64 --lr 1e-3 \
+  --folds 4 \
+  --latent 32 --hidden 64 \
+  --save_dir ./runs
+```
+
+``` bash
+# Run the model training v0.0.3 ~ v0.0.5
 python main.py \
   --data_root ./raw_data \
   --target_hz 100 \

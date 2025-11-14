@@ -2,19 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + 4-Fold CV
-
-출력(DAE 전용):
-- figs_fold{K}/train_latent_pca_boundary.png : Train 잠재 2D(PCA) 산점도 + DAE 결정경계
-- figs_fold{K}/test_latent_pca_boundary.png  : Test  잠재 2D(PCA) 산점도 + DAE 결정경계
-- figs_fold{K}/train_confusion_dae.png       : Train 혼동행렬 (DAE)
-- figs_fold{K}/test_confusion_dae.png        : Test  혼동행렬 (DAE)
+IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + K-Fold CV
+사람별 학습 + PCA 2D 시각화 + SVM 곡선 경계 (표준화 & gamma 숫자 지원)
 """
 
 import os, io, csv, re, math, json, argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -27,6 +22,8 @@ from sklearn.metrics import classification_report, roc_auc_score, average_precis
 from sklearn.model_selection import KFold
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler  # ★ 표준화
 
 import matplotlib
 matplotlib.use("Agg")
@@ -95,52 +92,34 @@ def _dump_head(raw_bytes: bytes, zip_name: str, inner_name: str):
 def _read_csv_robust(raw_bytes: bytes) -> Optional[pd.DataFrame]:
     raw_bytes = raw_bytes.replace(b"\x00", b"")
     encodings = ['utf-8','utf-8-sig','cp949','euc-kr','utf-16','utf-16le','utf-16be','latin-1']
-    decimals = ['.', ',']; seps = [',','\t',';','|']
 
     def try_decode(enc):
         try: return raw_bytes.decode(enc)
         except: return None
+
     def try_pd(txt, **kw):
         return pd.read_csv(io.StringIO(txt), engine='python', on_bad_lines='skip', **kw)
 
+    # 1) 기본 시도
     for enc in encodings:
         txt = try_decode(enc)
         if txt is None: continue
-        for dec in decimals:
-            try: return try_pd(txt, sep=None, decimal=dec)
-            except: pass
+        try: return try_pd(txt)
+        except: pass
 
-    def find_header_line(text):
-        lines = text.splitlines()
-        for i, line in enumerate(lines[:300]):
-            low = line.lower()
-            if ('x' in low and 'y' in low and 'z' in low) and ('time' in low or 'timestamp' in low or 'seconds_elapsed' in low):
-                return i
-        return None
-
+    # 2) 헤더/구분자 추정 시도
     for enc in encodings:
-        txt = try_decode(enc); 
+        txt = try_decode(enc)
         if txt is None: continue
-        hdr = find_header_line(txt)
         try:
             sample = "\n".join([ln for ln in txt.splitlines() if ln.strip()][:80])
-            sniff_sep = csv.Sniffer().sniff(sample, delimiters=",".join(seps)).delimiter
+            sniff_sep = csv.Sniffer().sniff(sample, delimiters=",\t;|").delimiter
         except: sniff_sep = None
-        for dec in decimals:
-            if hdr is not None:
-                for sep in [sniff_sep] + [s for s in seps if s and s != sniff_sep]:
-                    try: return try_pd(txt, sep=sep if sep else None, decimal=dec, skiprows=hdr)
-                    except: pass
-            for sep in ([sniff_sep] if sniff_sep else []) + seps:
-                try: return try_pd(txt, sep=sep, decimal=dec)
-                except: pass
-
-    for enc in encodings:
-        txt = try_decode(enc); 
-        if txt is None: continue
-        for dec in decimals:
-            try: return try_pd(txt, header=None, decimal=dec)
+        for sep in [sniff_sep, ',', '\t', ';', '|']:
+            if not sep: continue
+            try: return try_pd(txt, sep=sep)
             except: pass
+
     return None
 
 
@@ -158,13 +137,6 @@ def _parse_sensor_csv(raw_bytes: bytes, zip_name: str, inner_name: str) -> Optio
         _dump_head(raw_bytes, zip_name, inner_name); return None
 
     df.columns = [str(c).strip().lower() for c in df.columns]
-    cols_low = df.columns.tolist()
-
-    # 특수 패턴: time,seconds_elapsed,z,y,x → x,y,z 보정
-    if len(cols_low) >= 5 and cols_low[:5] == ['time','seconds_elapsed','z','y','x']:
-        df.columns = ['time','seconds_elapsed','z','y','x'] + [f'extra_{i}' for i in range(len(df.columns)-5)]
-
-    # timestamp 확정
     tcol = None
     for cand in ['timestamp','time','datetime']:
         if cand in df.columns: tcol = cand; break
@@ -240,6 +212,7 @@ class WindowData:
     feats: np.ndarray   # [C, T]
     label: int          # 0/1
     group: str
+    subject: str        # 사람 ID
 
 class WindowDatasetTorch(Dataset):
     def __init__(self, items: List[WindowData]): self.items = items
@@ -252,7 +225,8 @@ def collate_fn(batch):
     xs, ys = zip(*batch)
     return torch.stack(xs, dim=0), torch.stack(ys, dim=0)
 
-def build_windows_from_series(df: pd.DataFrame, win_sec: int, stride_sec: int, label: int, target_hz: int, group: str, trim_sec: int = 5):
+def build_windows_from_series(df: pd.DataFrame, win_sec: int, stride_sec: int, label: int,
+                              target_hz: int, group: str, subject: str, trim_sec: int = 5):
     for c in SENSOR_COLS:
         if c not in df.columns: df[c] = np.nan
         df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -267,14 +241,33 @@ def build_windows_from_series(df: pd.DataFrame, win_sec: int, stride_sec: int, l
     ws = window_stack(arr, win_len, stride)
     if ws.shape[0] == 0: return []
     ws = np.transpose(ws, (0, 2, 1))  # [N,C,T]
-    return [WindowData(feats=ws[i], label=label, group=group) for i in range(ws.shape[0])]
+    return [WindowData(feats=ws[i], label=label, group=group, subject=subject) for i in range(ws.shape[0])]
+
+def subject_from_stem(stem: str) -> str:
+    """
+    규칙:
+      - '123.o' / '123.x' -> '123'
+      - 'o_123' / 'x_123' -> '123'
+      - 그 외: 첫 '.' 앞부분이 있으면 그걸, 없으면 전체
+    """
+    if not stem:
+        return stem
+    m = re.match(r'^(?P<id>.+?)\.[ox]$', stem, flags=re.IGNORECASE)
+    if m:
+        return m.group('id')
+    m2 = re.match(r'^[ox]_(?P<id>.+)$', stem, flags=re.IGNORECASE)
+    if m2:
+        return m2.group('id')
+    return stem.split('.')[0]
 
 def load_dataset(data_root: Path, target_hz: int, win_sec: int, stride_sec: int, trim_sec: int):
     items: List[WindowData] = []
     for lbl_name, lbl_val in [("o",1),("x",0)]:
         for zp in sorted((data_root / lbl_name).glob("*.zip")):
+            subject_id = subject_from_stem(zp.stem)
             for df in read_all_series_from_zip(zp, target_hz):
-                items.extend(build_windows_from_series(df, win_sec, stride_sec, lbl_val, target_hz, group=zp.stem, trim_sec=trim_sec))
+                items.extend(build_windows_from_series(df, win_sec, stride_sec, lbl_val, target_hz,
+                                                       group=zp.stem, subject=subject_id, trim_sec=trim_sec))
     return items
 
 
@@ -319,6 +312,7 @@ class Decoder1D(nn.Module):
 class AE1D(nn.Module):
     def __init__(self, in_ch=6, hidden=64, latent=32):
         super().__init__()
+        self.latent_dim = latent
         self.enc = Encoder1D(in_ch, hidden, latent)
         self.dec = Decoder1D(latent, hidden, in_ch)
     def forward(self, x):
@@ -441,63 +435,117 @@ def dae_logits_and_latent(ae: AE1D, clf_head: LatentClassifier, loader: DataLoad
     if probs_list:
         return np.concatenate(probs_list), np.concatenate(y_list), np.concatenate(latent_list)
     else:
-        return np.array([]), np.array([]), np.zeros((0, ae.enc.net[-2].num_features), dtype=np.float32)
+        return np.array([]), np.array([]), np.zeros((0, ae.latent_dim), dtype=np.float32)
 
 
-# ------------------ Visualization: PCA 2D + DAE boundary ------------------
-def _plot_latent_pca_with_dae_boundary(X_latent_tr, y_true_tr, dae_pred_tr,
-                                       X_latent_te, y_true_te, dae_pred_te,
-                                       out_tr, out_te, title_tr, title_te):
+# ------------------ PCA + Curved Boundary (with Standardization) ------------------
+def _plot_latent_pca_with_dae_boundary(
+    X_latent_tr: np.ndarray, y_true_tr: np.ndarray, dae_pred_tr: np.ndarray,
+    X_latent_te: np.ndarray, y_true_te: np.ndarray, dae_pred_te: np.ndarray,
+    out_tr: Path, out_te: Path, title_tr: str, title_te: str,
+    boundary_mode: str = 'rbf_svm', svm_c: float = 1.0, svm_gamma: Union[str,float] = 'scale'
+):
     """
-    - PCA는 train latent에 맞춰 학습 → train/test 동일 변환
-    - 결정경계는 PCA 2D에서 DAE의 예측(0/1)을 타깃으로 하는 로지스틱 회귀로 근사
+    PCA(2D) → StandardScaler → 분류기(SVM/LogReg) → contourf + boundary
+    - boundary_mode: 'rbf_svm' | 'logreg' | 'auto'
+    - svm_gamma: 'scale'/'auto' 또는 float (예: 2.0)
     """
-    if X_latent_tr.shape[0] == 0: return
+    if X_latent_tr.shape[0] == 0:
+        return
+
+    # 1) PCA 2D
     pca = PCA(n_components=2, random_state=42)
     Ztr = pca.fit_transform(X_latent_tr)
-    Zte = pca.transform(X_latent_te) if X_latent_te.shape[0] else np.zeros((0,2))
+    Zte = pca.transform(X_latent_te) if X_latent_te.shape[0] else np.zeros((0, 2))
 
-    # 경계 근사: DAE 예측값을 레이블로 사용
-    proxy = LogisticRegression(class_weight='balanced', max_iter=200)
-    proxy.fit(Ztr, dae_pred_tr.astype(int))
+    # 1.5) Standardization (곡선 표현 강화)
+    scaler = StandardScaler()
+    Ztr_s = scaler.fit_transform(Ztr)
+    Zte_s = scaler.transform(Zte) if Zte.shape[0] else np.zeros((0,2))
 
-    def plot_one(Z, y_true, fname, title):
-        if Z.shape[0]==0: return
+    # 2) 경계 학습 라벨 선택
+    lab_tr = dae_pred_tr.astype(int); source = "DAE"
+    if np.unique(lab_tr).size < 2:
+        if np.unique(y_true_tr.astype(int)).size >= 2:
+            lab_tr = y_true_tr.astype(int); source = "TRUE"
+        else:
+            lab_tr = None  # 경계 생략
+
+    # 3) 분류기 학습
+    clf = None; tag = None
+    if lab_tr is not None:
+        mode = boundary_mode
+        # 우선 SVM 시도 (auto 면 SVM 먼저)
+        if mode in ('rbf_svm', 'auto'):
+            try:
+                clf = SVC(kernel='rbf', C=svm_c, gamma=svm_gamma, class_weight='balanced')
+                clf.fit(Ztr_s, lab_tr)
+                tag = f"SVM({source}, C={svm_c}, gamma={svm_gamma})"
+            except Exception:
+                clf = None
+                # auto면 logreg로 폴백
+                if mode == 'auto':
+                    mode = 'logreg'
+        # 로지스틱
+        if (mode == 'logreg') and (clf is None):
+            try:
+                clf = LogisticRegression(class_weight='balanced', max_iter=200)
+                clf.fit(Ztr_s, lab_tr)
+                tag = f"LogReg({source})"
+            except Exception:
+                clf = None
+
+    # 4) 그림 (스케일된 좌표계에서)
+    def plot_one(Zs, y_true, fname, title):
+        if Zs.shape[0] == 0:
+            return
         plt.figure()
-        idx0=(y_true==0); idx1=(y_true==1)
-        plt.scatter(Z[idx0,0], Z[idx0,1], s=12, label='normal (true)')
-        plt.scatter(Z[idx1,0], Z[idx1,1], s=12, label='abnormal (true)')
+        idx0 = (y_true == 0); idx1 = (y_true == 1)
+        plt.scatter(Zs[idx0,0], Zs[idx0,1], s=12, label='normal (true)')
+        plt.scatter(Zs[idx1,0], Zs[idx1,1], s=12, label='abnormal (true)')
 
-        # 결정경계
-        x_min, x_max = np.percentile(Z[:,0], 1), np.percentile(Z[:,0], 99)
-        y_min, y_max = np.percentile(Z[:,1], 1), np.percentile(Z[:,1], 99)
-        xx, yy = np.meshgrid(np.linspace(x_min, x_max, 300),
-                             np.linspace(y_min, y_max, 300))
-        grid = np.c_[xx.ravel(), yy.ravel()]
-        zz = proxy.decision_function(grid).reshape(xx.shape)
-        cs = plt.contour(xx, yy, zz, levels=[0.0])
-        if cs.collections: cs.collections[0].set_label('DAE decision boundary')
+        if clf is not None and Zs.shape[0] > 5:
+            x_min, x_max = np.percentile(Zs[:,0], 1), np.percentile(Zs[:,0], 99)
+            y_min, y_max = np.percentile(Zs[:,1], 1), np.percentile(Zs[:,1], 99)
+            xx, yy = np.meshgrid(np.linspace(x_min, x_max, 400),
+                                 np.linspace(y_min, y_max, 400))
+            grid = np.c_[xx.ravel(), yy.ravel()]
+            zz = clf.decision_function(grid).reshape(xx.shape)
+
+            # 결정함수 히트맵과 경계선(0 레벨)
+            plt.contourf(xx, yy, zz, levels=np.linspace(zz.min(), zz.max(), 20), alpha=0.25)
+            cs = plt.contour(xx, yy, zz, levels=[0.0], linewidths=2)
+            if cs.collections and tag:
+                cs.collections[0].set_label(tag)
 
         plt.title(title); plt.legend(); plt.tight_layout()
         plt.savefig(fname, dpi=150); plt.close()
 
-    plot_one(Ztr, y_true_tr, out_tr, title_tr)
-    plot_one(Zte, y_true_te, out_te, title_te)
+    plot_one(Ztr_s, y_true_tr, out_tr, title_tr)
+    plot_one(Zte_s, y_true_te, out_te, title_te)
 
 
+# ------------------ Confusion matrix plot ------------------
 def _plot_confusion(y_true, y_pred, outpath, title):
-    if y_true.size==0 or y_pred.size==0: return
-    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
-    plt.figure(); plt.imshow(cm, interpolation='nearest'); plt.title(title)
-    plt.xticks([0,1], ['normal','abnormal']); plt.yticks([0,1], ['normal','abnormal'])
+    if y_true.size == 0 or y_pred.size == 0:
+        return
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    plt.figure()
+    plt.imshow(cm, interpolation='nearest')
+    plt.title(title)
+    plt.xticks([0, 1], ['normal', 'abnormal'])
+    plt.yticks([0, 1], ['normal', 'abnormal'])
     for i in range(2):
         for j in range(2):
-            plt.text(j,i,str(cm[i,j]), ha='center', va='center')
-    plt.xlabel('Predicted (DAE)'); plt.ylabel('True'); plt.tight_layout()
-    plt.savefig(outpath, dpi=150); plt.close()
+            plt.text(j, i, str(cm[i, j]), ha='center', va='center')
+    plt.xlabel('Predicted (DAE)')
+    plt.ylabel('True')
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
 
 
-# ------------------ Main CV pipeline ------------------
+# ------------------ Args ------------------
 @dataclass
 class Args:
     data_root: str
@@ -513,7 +561,20 @@ class Args:
     hidden: int
     device: str
     save_dir: str
+    boundary_mode: str   # 'rbf_svm' | 'logreg' | 'auto'
+    svm_c: float
+    svm_gamma: Union[str, float]  # 'scale'|'auto'|float
 
+
+def _parse_gamma(g: str) -> Union[str, float]:
+    """ 'scale'/'auto' 그대로, 숫자 문자열은 float 변환 """
+    try:
+        return float(g)
+    except:
+        return g
+
+
+# ------------------ Run (Per Subject CV) ------------------
 def run(args: Args):
     set_seed(42)
     device = args.device if torch.cuda.is_available() and args.device.startswith('cuda') else 'cpu'
@@ -523,87 +584,116 @@ def run(args: Args):
     items = load_dataset(data_root, args.target_hz, args.window_sec, args.stride_sec, args.trim_sec)
     if len(items) == 0:
         raise RuntimeError("No usable windows built. Check data paths and CSV format.")
-    print(f"[INFO] Total windows: {len(items)} (pos={sum(i.label for i in items)}, neg={len(items)-sum(i.label for i in items)})")
+    print(f"[INFO] Total windows: {len(items)} "
+          f"(pos={sum(i.label for i in items)}, neg={len(items)-sum(i.label for i in items)})")
 
-    all_idx = np.arange(len(items))
-    kf = KFold(n_splits=args.folds, shuffle=True, random_state=42)
-    fold_reports = []
+    subjects = sorted({it.subject for it in items})
+    print(f"[INFO] Found {len(subjects)} subjects:", subjects)
+
     os.makedirs(args.save_dir, exist_ok=True)
+    global_summary = []
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(all_idx), 1):
-        print(f"\n======= Fold {fold}/{args.folds} =======")
-        train_items = [items[i] for i in train_idx]
-        val_items   = [items[i] for i in val_idx]
+    svm_gamma_final = _parse_gamma(str(args.svm_gamma))  # 숫자도 허용
 
-        # --- D-AE 구성 ---
-        ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
-        clf_head = LatentClassifier(in_dim=args.latent, hidden=args.hidden).to(device)
-        proj_head = ProjectionHead(in_dim=args.latent, proj_dim=64).to(device)
+    for sid in subjects:
+        subj_items = [it for it in items if it.subject == sid]
+        if len(subj_items) < max(2, args.folds):
+            print(f"[WARN] Subject {sid}: not enough samples/windows for {args.folds}-fold CV (N={len(subj_items)}). Skipping.")
+            continue
 
-        tr_loader = DataLoader(WindowDatasetTorch(train_items), batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn=collate_fn)
-        va_loader = DataLoader(WindowDatasetTorch(val_items),   batch_size=args.batch_size, shuffle=False, drop_last=False, collate_fn=collate_fn)
+        print(f"\n================ Subject {sid} ================")
+        all_idx = np.arange(len(subj_items))
+        kf = KFold(n_splits=args.folds, shuffle=True, random_state=42)
+        fold_reports = []
 
-        print("[INFO] Train Discriminative AE (recon + supcon + bce)...")
-        if len(tr_loader.dataset)>0:
-            train_discriminative_ae(
-                ae, clf_head, proj_head,
-                tr_loader, va_loader,
-                epochs=args.epochs_ae, lr=args.lr, device=device,
-                w_rec=1.0, w_con=0.5, w_cls=0.5, temperature=0.07
+        subj_dir = Path(args.save_dir) / f"subject_{sid}"
+        subj_dir.mkdir(parents=True, exist_ok=True)
+
+        for fold, (train_idx, val_idx) in enumerate(kf.split(all_idx), 1):
+            print(f"\n------- [Subject {sid}] Fold {fold}/{args.folds} -------")
+            train_items = [subj_items[i] for i in train_idx]
+            val_items   = [subj_items[i] for i in val_idx]
+
+            ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
+            clf_head = LatentClassifier(in_dim=args.latent, hidden=args.hidden).to(device)
+            proj_head = ProjectionHead(in_dim=args.latent, proj_dim=64).to(device)
+
+            tr_loader = DataLoader(WindowDatasetTorch(train_items), batch_size=args.batch_size,
+                                   shuffle=True, drop_last=False, collate_fn=collate_fn)
+            va_loader = DataLoader(WindowDatasetTorch(val_items),   batch_size=args.batch_size,
+                                   shuffle=False, drop_last=False, collate_fn=collate_fn)
+
+            print("[INFO] Train Discriminative AE (recon + supcon + bce)...")
+            if len(tr_loader.dataset) > 0:
+                train_discriminative_ae(
+                    ae, clf_head, proj_head,
+                    tr_loader, va_loader,
+                    epochs=args.epochs_ae, lr=args.lr, device=device,
+                    w_rec=1.0, w_con=0.5, w_cls=0.5, temperature=0.07
+                )
+            else:
+                print("[WARN] Empty training set for DAE.")
+
+            print("[INFO] Evaluate & collect latent...")
+            p_tr, y_tr, Ztr = dae_logits_and_latent(ae, clf_head, tr_loader, device)
+            p_te, y_te, Zte = dae_logits_and_latent(ae, clf_head, va_loader, device)
+
+            def to_metrics(p, y):
+                if y.size==0: return (float('nan'), float('nan'), {}), np.array([]).astype(int)
+                yhat = (p>=0.5).astype(int)
+                try: roc = roc_auc_score(y, p)
+                except: roc = float('nan')
+                try: pr  = average_precision_score(y, p)
+                except: pr = float('nan')
+                rep = classification_report(y, yhat, output_dict=True, zero_division=0)
+                return (roc, pr, rep), yhat
+
+            (roc_tr, pr_tr, rep_tr), y_tr_hat = to_metrics(p_tr, y_tr)
+            (roc_te, pr_te, rep_te), y_te_hat = to_metrics(p_te, y_te)
+
+            print(f"[Subject {sid} | FOLD {fold}] "
+                  f"ROC-AUC (train)={roc_tr:.4f} (test)={roc_te:.4f} | "
+                  f"PR-AUC (train)={pr_tr:.4f} (test)={pr_te:.4f}")
+
+            fold_reports.append({
+                "subject": sid,
+                "fold": fold,
+                "train": {"roc_auc": roc_tr, "pr_auc": pr_tr, "report": rep_tr},
+                "test":  {"roc_auc": roc_te, "pr_auc": pr_te, "report": rep_te},
+            })
+            with open(subj_dir / f"fold{fold}_report.json", 'w') as f:
+                json.dump(fold_reports[-1], f, indent=2)
+
+            torch.save(
+                {"ae": ae.state_dict(), "clf_head": clf_head.state_dict(), "proj_head": proj_head.state_dict()},
+                subj_dir / f"fold{fold}_ckpt.pt"
             )
-        else:
-            print("[WARN] Empty training set for DAE.")
 
-        # --- 평가 (DAE 확률/예측 + 잠재 수집) ---
-        print("[INFO] Evaluate & collect latent...")
-        p_tr, y_tr, Ztr = dae_logits_and_latent(ae, clf_head, tr_loader, device)
-        p_te, y_te, Zte = dae_logits_and_latent(ae, clf_head, va_loader, device)
+            figs_dir = subj_dir / f"figs_fold{fold}"
+            figs_dir.mkdir(parents=True, exist_ok=True)
 
-        def to_metrics(p, y):
-            if y.size==0: return (float('nan'), float('nan'), {}), np.array([]).astype(int)
-            yhat = (p>=0.5).astype(int)
-            try: roc = roc_auc_score(y, p)
-            except: roc = float('nan')
-            try: pr  = average_precision_score(y, p)
-            except: pr = float('nan')
-            rep = classification_report(y, yhat, output_dict=True)
-            return (roc, pr, rep), yhat
+            _plot_latent_pca_with_dae_boundary(
+                X_latent_tr=Ztr, y_true_tr=y_tr, dae_pred_tr=(p_tr>=0.5).astype(int),
+                X_latent_te=Zte, y_true_te=y_te, dae_pred_te=(p_te>=0.5).astype(int),
+                out_tr=figs_dir/"train_latent_pca_boundary.png",
+                out_te=figs_dir/"test_latent_pca_boundary.png",
+                title_tr=f"Subject {sid} — Fold {fold} — Train Latent (PCA+Std) + boundary",
+                title_te=f"Subject {sid} — Fold {fold} — Test Latent (PCA+Std) + boundary",
+                boundary_mode=args.boundary_mode, svm_c=args.svm_c, svm_gamma=svm_gamma_final
+            )
 
-        (roc_tr, pr_tr, rep_tr), y_tr_hat = to_metrics(p_tr, y_tr)
-        (roc_te, pr_te, rep_te), y_te_hat = to_metrics(p_te, y_te)
+            _plot_confusion(y_tr.astype(int), (p_tr>=0.5).astype(int), figs_dir/"train_confusion_dae.png",
+                            f"Subject {sid} — Fold {fold} — Train Confusion (DAE)")
+            _plot_confusion(y_te.astype(int), (p_te>=0.5).astype(int), figs_dir/"test_confusion_dae.png",
+                            f"Subject {sid} — Fold {fold} — Test Confusion (DAE)")
 
-        print(f"[FOLD {fold}] ROC-AUC (train)={roc_tr:.4f} (test)={roc_te:.4f} | PR-AUC (train)={pr_tr:.4f} (test)={pr_te:.4f}")
+        with open(subj_dir / "cv_summary.json", 'w') as f:
+            json.dump(fold_reports, f, indent=2)
+        global_summary.extend(fold_reports)
 
-        fold_reports.append({
-            "fold": fold,
-            "train": {"roc_auc": roc_tr, "pr_auc": pr_tr, "report": rep_tr},
-            "test":  {"roc_auc": roc_te, "pr_auc": pr_te, "report": rep_te},
-        })
-        with open(Path(args.save_dir)/f"fold{fold}_report.json",'w') as f: json.dump(fold_reports[-1], f, indent=2)
-        torch.save({"ae": ae.state_dict(), "clf_head": clf_head.state_dict(), "proj_head": proj_head.state_dict()}, Path(args.save_dir)/f"fold{fold}_ckpt.pt")
-
-        # ---------- DAE 전용 시각화 ----------
-        figs_dir = Path(args.save_dir)/f"figs_fold{fold}"
-        figs_dir.mkdir(parents=True, exist_ok=True)
-
-        # (1) Latent PCA 2D + DAE 경계(로지스틱으로 근사)
-        _plot_latent_pca_with_dae_boundary(
-            X_latent_tr=Ztr, y_true_tr=y_tr, dae_pred_tr=(p_tr>=0.5).astype(int),
-            X_latent_te=Zte, y_true_te=y_te, dae_pred_te=(p_te>=0.5).astype(int),
-            out_tr=figs_dir/"train_latent_pca_boundary.png",
-            out_te=figs_dir/"test_latent_pca_boundary.png",
-            title_tr=f"Fold {fold} — Train Latent (PCA) + DAE boundary",
-            title_te=f"Fold {fold} — Test Latent (PCA) + DAE boundary"
-        )
-
-        # (2) 혼동행렬 (DAE 기준)
-        _plot_confusion(y_tr.astype(int), (p_tr>=0.5).astype(int), figs_dir/"train_confusion_dae.png",
-                        f"Fold {fold} — Train Confusion (DAE)")
-        _plot_confusion(y_te.astype(int), (p_te>=0.5).astype(int), figs_dir/"test_confusion_dae.png",
-                        f"Fold {fold} — Test Confusion (DAE)")
-
-    with open(Path(args.save_dir)/"cv_summary.json",'w') as f: json.dump(fold_reports, f, indent=2)
-    print("[DONE] CV reports & figures saved to", args.save_dir)
+    with open(Path(args.save_dir) / "all_subjects_summary.json", 'w') as f:
+        json.dump(global_summary, f, indent=2)
+    print("[DONE] Per-subject CV complete. Results saved under", args.save_dir)
 
 
 # ------------------ CLI ------------------
@@ -622,6 +712,24 @@ if __name__ == "__main__":
     p.add_argument('--hidden', type=int, default=64)
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--save_dir', type=str, default='./runs')
+    # --- curved boundary options ---
+    p.add_argument('--boundary_mode', type=str, default='rbf_svm',
+                   choices=['rbf_svm','logreg','auto'],
+                   help="경계 근사 방식: rbf_svm(곡선, 기본), logreg(직선), auto(가능하면 SVM)")
+    p.add_argument('--svm_c', type=float, default=1.0, help='RBF-SVM C')
+    p.add_argument('--svm_gamma', type=str, default='scale',
+                   help="RBF-SVM gamma: 'scale'/'auto' 또는 숫자 문자열(예: '2.0')")
     args_ns = p.parse_args()
-    run(Args(**vars(args_ns)))
+
+    # argparse는 문자열로 받으므로, 숫자면 float로 변환
+    gamma_val: Union[str, float] = _parse_gamma(args_ns.svm_gamma)
+    args = Args(
+        data_root=args_ns.data_root, target_hz=args_ns.target_hz,
+        window_sec=args_ns.window_sec, stride_sec=args_ns.stride_sec, trim_sec=args_ns.trim_sec,
+        epochs_ae=args_ns.epochs_ae, batch_size=args_ns.batch_size, lr=args_ns.lr,
+        folds=args_ns.folds, latent=args_ns.latent, hidden=args_ns.hidden,
+        device=args_ns.device, save_dir=args_ns.save_dir,
+        boundary_mode=args_ns.boundary_mode, svm_c=args_ns.svm_c, svm_gamma=gamma_val
+    )
+    run(args)
 
