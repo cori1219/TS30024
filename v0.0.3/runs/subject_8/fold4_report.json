@@ -9,7 +9,7 @@
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 16.0
+        "support": 15.0
       },
       "1.0": {
         "precision": 1.0,
@@ -22,13 +22,13 @@
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 32.0
+        "support": 31.0
       },
       "weighted avg": {
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 32.0
+        "support": 31.0
       }
     }
   },
@@ -40,13 +40,13 @@
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 5.0
+        "support": 6.0
       },
       "1.0": {
         "precision": 1.0,
         "recall": 1.0,
         "f1-score": 1.0,
-        "support": 5.0
+        "support": 4.0
       },
       "accuracy": 1.0,
       "macro avg": {
