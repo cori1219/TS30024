@@ -220,77 +220,81 @@ python imu_udp_infer.py --target-hz 100 \
 
 **v0.3.0 — 2025-09-26**  
 - **Added**  
-  - **TSMixer 인코더**(`--encoder tsmixer`) 추가: All-MLP 기반 토큰/채널 믹싱으로 시계열 표현력 확장.  
-  - 하이퍼파라미터: `--tsm_depth`, `--tsm_token_ratio`, `--tsm_channel_ratio`, `--tsm_dropout`.  
+  - Added **TSMixer encoder** (`--encoder tsmixer`): extends time-series representation power with all-MLP token/channel mixing.  
+  - Hyperparameters: `--tsm_depth`, `--tsm_token_ratio`, `--tsm_channel_ratio`, `--tsm_dropout`.  
 - **Changed**  
-  - 기본 풀링을 **Dot-Attention**(`--attn_pool dot`)으로 유지하며 TSMixer와 호환성 점검.  
-  - Fold별 채널 표준화 경로 정리(학습 통계로 fit → train/val 동일 적용).  
+  - Kept dot-product attention (`--attn_pool dot`) as the default pooling and verified compatibility with TSMixer.  
+  - Cleaned up per-fold channel normalization path (fit on train statistics → apply consistently to train/val).  
 - **Fixed**  
-  - **TSMixer Token-Mixing LayerNorm 축 오류** 수정: 시간축(T)에 대해 LN을 적용하도록 변경(런타임 shape 에러 해결).  
-  - 경계 시각화(히트맵 + 0-레벨 컨투어) 안정화.  
+  - Fixed **TSMixer token-mixing LayerNorm axis bug**: LayerNorm is now applied along the time axis (T), resolving runtime shape errors.  
+  - Stabilized boundary visualization (heatmap + 0-level contour).  
 - **Recommendation**  
-  - 빠른/안정 베이스라인: **v0.0.x** (Conv1D DAE + 전통 경계 근사)  
-  - 글로벌 정규화 + 곡선 경계 실험: **v0.2.x** (RBF-SVM, 표준화 파이프라인)  
-  - 본 버전(**v0.3.0**)은 **TSMixer 탐색** 중심의 실험 릴리스입니다.
+  - Fast/stable baseline: **v0.0.x** (Conv1D DAE + classical boundary approximation)  
+  - Global normalization + curved boundary experiments: **v0.2.x** (RBF-SVM, standardized pipeline)  
+  - This version (**v0.3.0**) is an experimental release focused on **TSMixer exploration**.
 
 **v0.2.0 — 2025-09-26**  
 - **Added**  
-  - **TimeMixer 인코더**(`--encoder timemixer`) 도입: MLP-Mixer 스타일 블록으로 시계열 패턴 병렬 학습.  
-  - 하이퍼파라미터: `--tm_depth`, `--tm_kernel`, `--tm_ch_hidden`, `--tm_dropout`.  
+  - Introduced **TimeMixer encoder** (`--encoder timemixer`): MLP-Mixer–style blocks for parallel learning of temporal patterns.  
+  - Hyperparameters: `--tm_depth`, `--tm_kernel`, `--tm_ch_hidden`, `--tm_dropout`.  
 - **Changed**  
-  - 모델 선택을 `--encoder {lstm,conv,timemixer}`로 통합(드롭인 교체).  
-  - 시각화/로그에 **Encoder + Pooling 태그** 표기(예: `TIMEMIXER + DOT`).  
+  - Unified model selection under `--encoder {lstm,conv,timemixer}` (drop-in replacement).  
+  - Added **Encoder + Pooling tags** in visualization/logs (e.g., `TIMEMIXER + DOT`).  
 - **Fixed**  
-  - Kalman 후 텐서/디바이스 변환 안정화, 경계 근사 입력 스케일링 예외 처리 보강.  
+  - Improved robustness for tensor/device conversion after Kalman smoothing and for boundary-approximation input scaling edge cases.  
 - **Perf/Deploy**  
-  - TimeMixer 병렬화로 학습/추론 속도 향상, TorchScript/TFLite 친화.
+  - TimeMixer parallelization improves training/inference speed and is friendly to TorchScript / TFLite.
 
 **v0.1.1 — 2025-09-26**  
 - **Added**  
-  - **Attention Pooling** for time-series latent aggregation:
-    - `--attn_pool dot` (Dot-Product Attention, default)
-    - `--attn_pool mha` (1-layer Multi-Head Attention + CLS)
-    - `--attn_pool none` (mean pooling; 이전 동작)  
-  - 관련 하이퍼파라미터: `--attn_dropout`, `--attn_heads`(MHA 전용).  
+  - **Attention pooling** for time-series latent aggregation:
+    - `--attn_pool dot` (dot-product attention, default)
+    - `--attn_pool mha` (1-layer multi-head attention + CLS)
+    - `--attn_pool none` (mean pooling; previous behavior)  
+  - Related hyperparameters: `--attn_dropout`, `--attn_heads` (for MHA).  
 - **Changed**  
-  - 분류 입력을 **Attention으로 가중합**한 latent로 교체(시간적 중요도 반영).  
-  - 학습/평가 로그에 **Encoder+Pooling 표기**(예: `LSTM + DOT`).  
+  - Replaced classifier input with **attention-weighted latent** (reflects temporal importance).  
+  - Added **Encoder + Pooling tag** to training/eval logs (e.g., `LSTM + DOT`).  
 - **Fixed**  
-  - Kalman 이후 텐서 전환 시 드문 디바이스/형 변환 경계 케이스 보완.
+  - Made Kalman-to-tensor conversion more robust for rare device/dtype boundary cases.
 
 **v0.1.0 — 2025-09-25**  
 - **Added**  
-  - **LSTM 인코더** 지원(`--encoder lstm`), 시계열 의존성 학습 강화.  
-  - Kalman smoothing과 결합한 시계열 잠재 안정화.  
+  - Added **LSTM encoder** support (`--encoder lstm`) to better capture temporal dependencies.  
+  - Combined LSTM latent with Kalman smoothing for more stable time-series representations.  
 - **Changed**  
-  - 분류 입력을 LSTM 기반 latent로 전환(시계열 정보 보존).  
+  - Switched classifier input to LSTM-based latent (preserves sequence information).  
 - **Fixed**  
-  - LSTM 출력/헤드 차원 불일치 및 시퀀스 길이 처리 개선.
+  - Resolved LSTM output/head dimension mismatch and sequence length handling issues.
 
 **v0.0.5 — 2025-09-25**  
 - **Added**  
-  - **F1-score** 계산/로그 저장.  
+  - **F1-score** computation and logging.  
 - **Changed**  
-  - 전처리/리포팅 안정화, 지표 출력 정리.
+  - Stabilized preprocessing/reporting and cleaned up metric outputs.
 
 **v0.0.4 — 2025-09-25**  
 - **Added**  
-  - 전 피험자 **정규화 후 글로벌 학습** 옵션(데이터 결합).  
+  - Option for **global training after per-subject normalization** (merged data).  
 - **Changed**  
-  - 표준화/시각화 파이프라인 정리.
+  - Refined standardization/visualization pipeline.
 
 **v0.0.3 — 2025-09-25**  
 - **Added**  
-  - **RBF-SVM 경계 근사**, `--svm_gamma` 숫자/문자 옵션 지원.  
+  - **RBF-SVM boundary approximation** and flexible `--svm_gamma` options (numeric/string).  
 - **Changed**  
-  - PCA 후 **StandardScaler** 적용, 경계 시각화 강화.  
+  - Applied **StandardScaler after PCA** and enhanced boundary visualization.  
 - **Fixed**  
-  - 단일 클래스 경계 학습 시 안전 폴백 처리.
+  - Added safe fallback behavior when training a boundary with a single class.
 
 **v0.0.2 — 2025-09-25**  
-- **Added** 사람별 K-Fold CV, Kalman, PCA 2D + 경계 근사, 결과 디렉토리 구조.  
-- **Changed** DataLoader/AE 보완.  
-- **Fixed** 단일 클래스/리포트 경고 대응.
+- **Added**  
+  - Per-subject K-Fold CV, Kalman, PCA 2D + boundary approximation, and result directory layout.  
+- **Changed**  
+  - Improved DataLoader/AE.  
+- **Fixed**  
+  - Handled single-class/report warnings.
 
 **v0.0.1:** First version
+
 
