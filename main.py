@@ -4,7 +4,7 @@
 """
 IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + K-Fold CV
 전 피험자 합본(Global) 학습 + 훈련 통계로 채널별 표준화 + PCA 2D 시각화 + SVM/LogReg 경계
-F1-score 출력/저장 추가 (train/test)
+F1-score 출력/저장 + per-fold F1 최적 threshold 탐색 + class-weighted BCE
 """
 
 import os, io, csv, re, math, json, argparse
@@ -365,10 +365,12 @@ class SupConLoss(nn.Module):
         return loss.mean()
 
 class LatentClassifier(nn.Module):
+    """Latent → 이진 로짓. Dropout 추가로 약간의 regularization."""
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Dropout(p=0.3),
             nn.Linear(hidden, 1)
         )
     def forward(self, x):  # [B,in_dim]
@@ -383,12 +385,15 @@ def train_discriminative_ae(
     loader: DataLoader,
     valloader: Optional[DataLoader],
     epochs: int, lr: float, device: str,
-    w_rec=1.0, w_con=0.5, w_cls=0.5, temperature=0.07
+    # loss 비율: 분류쪽 가중치를 조금 더 키움
+    w_rec: float = 0.5, w_con: float = 0.5, w_cls: float = 1.0,
+    temperature: float = 0.07,
+    # BCE class weight
+    cls_w_pos: float = 1.0, cls_w_neg: float = 1.0
 ):
     ae.train(); clf_head.train(); proj_head.train()
     opt = torch.optim.Adam(list(ae.parameters()) + list(clf_head.parameters()) + list(proj_head.parameters()), lr=lr)
     recon = nn.SmoothL1Loss()
-    bce   = nn.BCEWithLogitsLoss()
     supcon = SupConLoss(temperature)
 
     for ep in range(1, epochs+1):
@@ -403,7 +408,18 @@ def train_discriminative_ae(
 
             loss_rec = recon(xr, xb)
             loss_con = supcon(z_proj, yb)
-            loss_cls = bce(logits, yb)
+
+            # class-weighted BCE
+            bce_raw = nn.functional.binary_cross_entropy_with_logits(
+                logits, yb, reduction='none'
+            )
+            cls_weights = torch.where(
+                yb > 0.5,
+                torch.tensor(cls_w_pos, device=yb.device),
+                torch.tensor(cls_w_neg, device=yb.device),
+            )
+            loss_cls = (bce_raw * cls_weights).mean()
+
             loss = w_rec*loss_rec + w_con*loss_con + w_cls*loss_cls
             loss.backward(); opt.step()
             tr += loss.item() * xb.size(0); n += xb.size(0)
@@ -419,9 +435,20 @@ def train_discriminative_ae(
                     z_pool = ae.pooled_latent(z)
                     logits = clf_head(z_pool)
                     z_proj = proj_head(z_pool)
+
                     loss_rec = recon(xr, xb)
                     loss_con = supcon(z_proj, yb)
-                    loss_cls = bce(logits, yb)
+
+                    bce_raw = nn.functional.binary_cross_entropy_with_logits(
+                        logits, yb, reduction='none'
+                    )
+                    cls_weights = torch.where(
+                        yb > 0.5,
+                        torch.tensor(cls_w_pos, device=yb.device),
+                        torch.tensor(cls_w_neg, device=yb.device),
+                    )
+                    loss_cls = (bce_raw * cls_weights).mean()
+
                     s += (w_rec*loss_rec + w_con*loss_con + w_cls*loss_cls).item() * xb.size(0); m += xb.size(0)
             val = s / max(1,m)
             ae.train(); clf_head.train(); proj_head.train()
@@ -586,6 +613,13 @@ def run(args: Args):
         # --- 채널별 표준화 통계 (train fold) ---
         ch_norm = ChannelNormalizer(); ch_norm.fit(train_items)
 
+        # --- class 비율로 BCE weight 계산 ---
+        num_pos = sum(it.label for it in train_items)
+        num_neg = len(train_items) - num_pos
+        print(f"[FOLD {fold}] pos={num_pos}, neg={num_neg}")
+        cls_w_pos = num_neg / (num_pos + 1e-8)
+        cls_w_neg = num_pos / (num_neg + 1e-8)
+
         # --- 모델 ---
         ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
         clf_head = LatentClassifier(in_dim=args.latent, hidden=args.hidden).to(device)
@@ -596,13 +630,14 @@ def run(args: Args):
         va_loader = DataLoader(WindowDatasetTorch(val_items, ch_norm),   batch_size=args.batch_size,
                                shuffle=False, drop_last=False, collate_fn=collate_fn)
 
-        print("[INFO] Train Discriminative AE (recon + supcon + bce)...")
+        print("[INFO] Train Discriminative AE (recon + supcon + class-weighted bce)...")
         if len(tr_loader.dataset)>0:
             train_discriminative_ae(
                 ae, clf_head, proj_head,
                 tr_loader, va_loader,
                 epochs=args.epochs_ae, lr=args.lr, device=device,
-                w_rec=1.0, w_con=0.5, w_cls=0.5, temperature=0.07
+                w_rec=0.5, w_con=0.5, w_cls=1.0, temperature=0.07,
+                cls_w_pos=cls_w_pos, cls_w_neg=cls_w_neg
             )
         else:
             print("[WARN] Empty training set for DAE.")
@@ -612,10 +647,10 @@ def run(args: Args):
         p_tr, y_tr, Ztr = dae_logits_and_latent(ae, clf_head, tr_loader, device)
         p_te, y_te, Zte = dae_logits_and_latent(ae, clf_head, va_loader, device)
 
-        def to_metrics(p, y):
+        def to_metrics(p, y, thr: float = 0.5):
             if y.size==0:
                 return (float('nan'), float('nan'), float('nan'), {}), np.array([]).astype(int)
-            yhat = (p>=0.5).astype(int)
+            yhat = (p>=thr).astype(int)
             try: roc = roc_auc_score(y, p)
             except: roc = float('nan')
             try: pr  = average_precision_score(y, p)
@@ -624,16 +659,32 @@ def run(args: Args):
             rep = classification_report(y, yhat, output_dict=True, zero_division=0)
             return (roc, pr, f1, rep), yhat
 
-        (roc_tr, pr_tr, f1_tr, rep_tr), y_tr_hat = to_metrics(p_tr, y_tr)
-        (roc_te, pr_te, f1_te, rep_te), y_te_hat = to_metrics(p_te, y_te)
+        # --- Train F1 기준 best threshold 탐색 ---
+        best_thr = 0.5
+        best_f1  = float('nan')
+        if y_tr.size > 0:
+            best_f1 = -1.0
+            for thr in np.linspace(0.05, 0.95, 181):  # 0.05 ~ 0.95, step=0.005
+                yhat_tmp = (p_tr >= thr).astype(int)
+                f1_tmp = f1_score(y_tr.astype(int), yhat_tmp.astype(int), zero_division=0)
+                if f1_tmp > best_f1:
+                    best_f1, best_thr = f1_tmp, thr
+            print(f"[FOLD {fold}] Best train F1={best_f1:.4f} at threshold={best_thr:.3f}")
+        else:
+            print(f"[FOLD {fold}] No train samples, using default threshold={best_thr:.3f}")
+
+        (roc_tr, pr_tr, f1_tr, rep_tr), y_tr_hat = to_metrics(p_tr, y_tr, thr=best_thr)
+        (roc_te, pr_te, f1_te, rep_te), y_te_hat = to_metrics(p_te, y_te, thr=best_thr)
 
         print(f"[FOLD {fold}] ROC-AUC train/test = {roc_tr:.4f} / {roc_te:.4f}")
         print(f"[FOLD {fold}] PR-AUC  train/test = {pr_tr:.4f} / {pr_te:.4f}")
         print(f"[FOLD {fold}] F1      train/test = {f1_tr:.4f} / {f1_te:.4f}")
+        print(f"[FOLD {fold}] Used threshold = {best_thr:.3f}")
 
         # 저장
         fold_report = {
             "fold": fold,
+            "threshold": float(best_thr),
             "train": {"roc_auc": roc_tr, "pr_auc": pr_tr, "f1": f1_tr, "report": rep_tr},
             "test":  {"roc_auc": roc_te, "pr_auc": pr_te, "f1": f1_te, "report": rep_te},
         }
@@ -647,8 +698,8 @@ def run(args: Args):
         figs_dir.mkdir(parents=True, exist_ok=True)
 
         _plot_latent_pca_with_dae_boundary(
-            X_latent_tr=Ztr, y_true_tr=y_tr, dae_pred_tr=(p_tr>=0.5).astype(int),
-            X_latent_te=Zte, y_true_te=y_te, dae_pred_te=(p_te>=0.5).astype(int),
+            X_latent_tr=Ztr, y_true_tr=y_tr, dae_pred_tr=(p_tr>=best_thr).astype(int),
+            X_latent_te=Zte, y_true_te=y_te, dae_pred_te=(p_te>=best_thr).astype(int),
             out_tr=figs_dir/"train_latent_pca_boundary.png",
             out_te=figs_dir/"test_latent_pca_boundary.png",
             title_tr=f"Fold {fold} — Train Latent (PCA+Std) + boundary",
@@ -656,9 +707,9 @@ def run(args: Args):
             boundary_mode=args.boundary_mode, svm_c=args.svm_c, svm_gamma=svm_gamma_final
         )
 
-        _plot_confusion(y_tr.astype(int), (p_tr>=0.5).astype(int), figs_dir/"train_confusion_dae.png",
+        _plot_confusion(y_tr.astype(int), y_tr_hat, figs_dir/"train_confusion_dae.png",
                         f"Fold {fold} — Train Confusion (DAE)")
-        _plot_confusion(y_te.astype(int), (p_te>=0.5).astype(int), figs_dir/"test_confusion_dae.png",
+        _plot_confusion(y_te.astype(int), y_te_hat, figs_dir/"test_confusion_dae.png",
                         f"Fold {fold} — Test Confusion (DAE)")
 
     with open(Path(args.save_dir)/"cv_summary.json",'w') as f: json.dump(cv_reports, f, indent=2)
