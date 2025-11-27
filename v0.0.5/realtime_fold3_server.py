@@ -1,51 +1,47 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+import eventlet
+eventlet.monkey_patch()
 
-"""
-Sensor Logger HTTP Push → 실시간 균형 이상 분류 서버
-(Conv DAE v0.0.x, fold3_ckpt.pt + fold3_norm.npz 사용)
-
-test 시점과 최대한 비슷하게:
-- 데이터 윈도우 구성: 100 Hz, 30초 (TARGET_HZ, WINDOW_SEC)
-- 채널 정규화: fold3 train 폴드에서 구한 mean/std 사용 (ChannelNormalizer와 동일)
-- 인코딩: Conv AE (AE1D)
-- Kalman smoothing 후 시간 평균 풀링
-- LatentClassifier 로 로짓 → sigmoid → threshold (0.5 기준)
-
-※ main.py 는 수정하지 않고, 이 파일 + export_fold3_norm.py 만 추가로 사용.
-"""
-
-import json
-from pathlib import Path
-from typing import Dict, List, Optional
-
+import sys, json, math, time
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from flask import Flask, request, jsonify
+from sklearn.decomposition import PCA  # [NEW] PCA for alignment
 
+# ==============================================================================
+# 1. Configuration & Constants
+# ==============================================================================
+PORT = 5000
+WINDOW_SEC = 30
+TARGET_HZ = 50  # 100Hz로 학습했으면 100으로 변경 필요 (여기선 기존 50 유지)
+WINDOW_LEN = WINDOW_SEC * TARGET_HZ  # 30 * 50 = 1500 samples
+BUFFER_Limit = WINDOW_LEN + 200      # 여유 버퍼
 
-# ----------------- 학습 때와 맞춰야 하는 설정 -----------------
-TARGET_HZ   = 100          # --target_hz
-WINDOW_SEC  = 30           # --window_sec
-WIN_LEN     = TARGET_HZ * WINDOW_SEC
-SENSOR_COLS = ["ax", "ay", "az", "gx", "gy", "gz"]
+# [MODIFIED] Threshold 및 전처리 옵션 설정
+THRESHOLD = 0.485
+ALIGN_AXES = True               # 학습 시 --align_axes를 썼다면 True
+EXCLUDE_AXES = ['az', 'gz']     # 학습 시 --exclude_axes로 뺀 축들 (예시)
 
-LATENT_DIM  = 32           # --latent
-HIDDEN_DIM  = 64           # --hidden
+# 입력으로 들어오는 전체 센서 키 (순서 중요)
+ALL_SENSOR_COLS = ["ax", "ay", "az", "gx", "gy", "gz"]
 
-# fold3 모델/정규화 파일
-CKPT_PATH   = Path("./runs/fold3_ckpt.pt")
-NORM_PATH   = Path("./runs/fold3_norm.npz")
-
-# test 시와 동일하게 threshold=0.5 사용 (v0.0.x 에서는 따로 튜닝 안 했으니까)
-THRESHOLD   = 0.5
+# 실제 모델에 들어가는 채널 계산
+MODEL_INPUT_COLS = [c for c in ALL_SENSOR_COLS if c not in EXCLUDE_AXES]
+N_INPUT_CH = len(MODEL_INPUT_COLS)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# 저장된 모델 경로 (main.py에서 저장한 fold3_ckpt.pt 등)
+CKPT_PATH = "./runs_global/fold3_ckpt.pt" 
+# 정규화 통계 (학습 데이터에서 구한 값을 하드코딩하거나 별도 파일 로드 필요)
+# 여기서는 예시로 0.0, 1.0 사용 (실제로는 fold_report나 별도 파일에서 로드 권장)
+NORM_MEAN = np.zeros(N_INPUT_CH, dtype=np.float32)
+NORM_STD  = np.ones(N_INPUT_CH, dtype=np.float32)
 
 
-# ----------------- 모델 정의 (main.py v0.0.x 와 동일 구조) -----------------
+# ==============================================================================
+# 2. Model Architecture (Must match main.py)
+# ==============================================================================
 class Encoder1D(nn.Module):
     def __init__(self, in_ch=6, hidden=64, latent=32):
         super().__init__()
@@ -54,10 +50,7 @@ class Encoder1D(nn.Module):
             nn.Conv1d(hidden, hidden, 5, padding=2), nn.ReLU(), nn.BatchNorm1d(hidden),
             nn.Conv1d(hidden, latent, 3, padding=1), nn.ReLU(),
         )
-
-    def forward(self, x):  # [B, C, T]
-        return self.net(x)  # [B, latent, T]
-
+    def forward(self, x): return self.net(x)
 
 class Decoder1D(nn.Module):
     def __init__(self, latent=32, hidden=64, out_ch=6):
@@ -67,10 +60,7 @@ class Decoder1D(nn.Module):
             nn.Conv1d(hidden, hidden, 5, padding=2), nn.ReLU(), nn.BatchNorm1d(hidden),
             nn.Conv1d(hidden, out_ch, 7, padding=3),
         )
-
-    def forward(self, z):  # [B, latent, T]
-        return self.net(z)  # [B, C, T]
-
+    def forward(self, z): return self.net(z)
 
 class AE1D(nn.Module):
     def __init__(self, in_ch=6, hidden=64, latent=32):
@@ -78,281 +68,209 @@ class AE1D(nn.Module):
         self.latent_dim = latent
         self.enc = Encoder1D(in_ch, hidden, latent)
         self.dec = Decoder1D(latent, hidden, in_ch)
-
     def forward(self, x):
-        z = self.enc(x)
-        xr = self.dec(z)
+        z = self.enc(x); xr = self.dec(z)
         return xr, z
-
     def pooled_latent(self, z):
-        # [B, D, T] -> [B, D]
         return z.mean(dim=-1)
-
 
 class LatentClassifier(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Dropout(p=0.3),
             nn.Linear(hidden, 1)
         )
-
-    def forward(self, x):  # [B, D]
-        return self.net(x).squeeze(-1)
-
+    def forward(self, x): return self.net(x).squeeze(-1)
 
 class SimpleKalman:
-    """학습 코드와 동일한 latent smoothing."""
-
     def __init__(self, dim: int, process_var: float = 1e-3, measure_var: float = 1e-2):
-        self.q = process_var
-        self.r = measure_var
-
+        self.q = process_var; self.r = measure_var
     def filter(self, seq: np.ndarray) -> np.ndarray:
-        """
-        seq: [T, D]
-        """
-        T, D = seq.shape
-        out = np.zeros_like(seq)
-        x = np.zeros(D)
-        p = np.ones(D)
-
+        T, D = seq.shape; out = np.zeros_like(seq)
+        x = np.zeros(D); p = np.ones(D)
         for t in range(T):
-            # prediction
-            x_pred = x
-            p_pred = p + self.q
-
-            # update
-            z = seq[t]
-            k = p_pred / (p_pred + self.r)
+            x_pred = x; p_pred = p + self.q
+            z = seq[t]; k = p_pred / (p_pred + self.r)
             x = x_pred + k * (z - x_pred)
             p = (1 - k) * p_pred
-
             out[t] = x
-
         return out
 
 
-# ----------------- Sensor Logger 세션 버퍼 -----------------
-class SessionBuffer:
-    """
-    Sensor Logger HTTP Push 스트림을 sessionId 별로 누적.
-
-    - accelerometer / gyroscope 를 각 DF에 timestamp index로 쌓고
-    - outer join + 100 Hz resample
-    - 마지막 30초 (WIN_LEN 샘플)만 잘라서 [T, 6] numpy 배열로 반환
-    """
-
-    def __init__(self):
-        self.acc_df = pd.DataFrame(columns=["ax", "ay", "az"])
-        self.gyr_df = pd.DataFrame(columns=["gx", "gy", "gz"])
-
-    def _trim_history(self, now_ts, keep_sec: int = 60):
-        cutoff = now_ts - pd.to_timedelta(keep_sec, unit="s")
-        if not self.acc_df.empty:
-            self.acc_df = self.acc_df[self.acc_df.index >= cutoff]
-        if not self.gyr_df.empty:
-            self.gyr_df = self.gyr_df[self.gyr_df.index >= cutoff]
-
-    def update_from_payload(self, payload: List[dict]):
-        for d in payload:
-            name = str(d.get("name", "")).lower()
-            t_ns = int(d.get("time"))
-            ts = pd.to_datetime(t_ns, unit="ns", utc=True)
-            values = d.get("values", {})
-
-            if name == "accelerometer":
-                ax = float(values.get("x", np.nan))
-                ay = float(values.get("y", np.nan))
-                az = float(values.get("z", np.nan))
-                self.acc_df.loc[ts, ["ax", "ay", "az"]] = [ax, ay, az]
-
-            elif name == "gyroscope":
-                gx = float(values.get("x", np.nan))
-                gy = float(values.get("y", np.nan))
-                gz = float(values.get("z", np.nan))
-                self.gyr_df.loc[ts, ["gx", "gy", "gz"]] = [gx, gy, gz]
-
-            self._trim_history(ts)
-
-    def _merged_resampled(self) -> Optional[pd.DataFrame]:
-        df_all = None
-        if not self.acc_df.empty:
-            df_all = self.acc_df.sort_index()
-        if not self.gyr_df.empty:
-            g = self.gyr_df.sort_index()
-            df_all = g if df_all is None else df_all.join(g, how="outer")
-
-        if df_all is None or df_all.empty:
-            return None
-
-        rule = pd.to_timedelta(1 / TARGET_HZ, unit="s")
-        idx = pd.date_range(df_all.index.min(), df_all.index.max(), freq=rule)
-        df_all = df_all.infer_objects(copy=False)
-        df_all = df_all.reindex(df_all.index.union(idx)).interpolate(method="time").reindex(idx)
-
-        for c in SENSOR_COLS:
-            if c not in df_all.columns:
-                df_all[c] = np.nan
-        df_all = df_all[SENSOR_COLS].interpolate(limit_direction="both")
-
-        return df_all
-
-    def current_window(self) -> Optional[np.ndarray]:
-        df_all = self._merged_resampled()
-        if df_all is None or df_all.empty:
-            return None
-
-        if len(df_all) < WIN_LEN:
-            return None
-
-        df_win = df_all.iloc[-WIN_LEN:]
-        return df_win.to_numpy(dtype=np.float32)  # [T, 6]
-
-    def num_samples(self) -> int:
-        df_all = self._merged_resampled()
-        return 0 if df_all is None else len(df_all)
+# ==============================================================================
+# 3. Global State
+# ==============================================================================
+app = Flask(__name__)
+model_ae = None
+model_clf = None
+buffer_data = []  # List of dicts: {'ax':..., 'gz':...}
+buffer_lock = eventlet.semaphore.Semaphore(1)
 
 
-# ----------------- fold3 모델 + 정규화 로딩 -----------------
-def load_fold3_model_and_norm():
-    # 모델
-    if not CKPT_PATH.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {CKPT_PATH}")
-    ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
-
-    ae = AE1D(in_ch=6, hidden=HIDDEN_DIM, latent=LATENT_DIM).to(DEVICE)
-    clf = LatentClassifier(in_dim=LATENT_DIM, hidden=HIDDEN_DIM).to(DEVICE)
-
-    ae.load_state_dict(ckpt["ae"])
-    clf.load_state_dict(ckpt["clf_head"])
+# ==============================================================================
+# 4. Helpers
+# ==============================================================================
+def load_resources():
+    global model_ae, model_clf
+    print(f"[INFO] Loading model from {CKPT_PATH}...")
+    print(f"[INFO] Config: Align={ALIGN_AXES}, Exclude={EXCLUDE_AXES}, InputCh={N_INPUT_CH}, Thr={THRESHOLD}")
+    
+    # 모델 초기화 (입력 채널 수 반영)
+    ae = AE1D(in_ch=N_INPUT_CH, hidden=64, latent=32).to(DEVICE)
+    clf = LatentClassifier(in_dim=32, hidden=64).to(DEVICE)
+    
+    # 체크포인트 로드
+    if torch.cuda.is_available():
+        ckpt = torch.load(CKPT_PATH)
+    else:
+        ckpt = torch.load(CKPT_PATH, map_location='cpu')
+        
+    ae.load_state_dict(ckpt['ae'])
+    clf.load_state_dict(ckpt['clf_head'])
+    
     ae.eval()
     clf.eval()
+    model_ae = ae
+    model_clf = clf
+    print("[INFO] Model loaded successfully.")
 
-    # 정규화 통계 (ChannelNormalizer.mean/std)
-    if not NORM_PATH.exists():
-        raise FileNotFoundError(
-            f"Normalization stats not found: {NORM_PATH}. "
-            f"Run export_fold3_norm.py first."
-        )
-    norm = np.load(NORM_PATH)
-    mean = norm["mean"].astype(np.float32)  # [6]
-    std  = norm["std"].astype(np.float32)   # [6]
-
-    print(f"[INFO] Loaded fold3 model from {CKPT_PATH}")
-    print(f"[INFO] Loaded fold3 norm from  {NORM_PATH}")
-    print(f"[INFO] Device: {DEVICE}, threshold={THRESHOLD:.3f}")
-    return ae, clf, mean, std
-
-
-@torch.no_grad()
-def predict_window(
-    ae: AE1D,
-    clf: LatentClassifier,
-    arr: np.ndarray,
-    global_mean: np.ndarray,
-    global_std: np.ndarray,
-    threshold: float,
-):
+# [NEW] PCA Alignment Helper
+def apply_pca_alignment(df_window: pd.DataFrame):
     """
-    arr: [T, 6] (T = 30초 * 100Hz)
-    global_mean / global_std: ChannelNormalizer 로 학습된 [6] 벡터
+    현재 윈도우 데이터에 대해 PCA 회전을 적용하여 축 정렬
     """
+    if len(df_window) < 10: return df_window
+    
+    # 가속도 데이터 추출
+    acc_cols = ['ax', 'ay', 'az']
+    # 데이터프레임에 해당 컬럼들이 다 있는지 확인
+    if not all(c in df_window.columns for c in acc_cols): return df_window
+    
+    acc_data = df_window[acc_cols].values
+    
+    # PCA 계산 (3축)
+    pca = PCA(n_components=3)
+    pca.fit(acc_data)
+    
+    # 가속도 회전 적용
+    df_window[acc_cols] = pca.transform(acc_data)
+    
+    # 자이로 회전 적용 (가속도의 회전 매트릭스 사용)
+    gyr_cols = ['gx', 'gy', 'gz']
+    if all(c in df_window.columns for c in gyr_cols):
+        R = pca.components_
+        df_window[gyr_cols] = df_window[gyr_cols].values @ R.T
+        
+    return df_window
 
-    x = arr.copy()  # [T, 6]
-    # test 때와 동일한 방식: 채널별 (x - mean)/std
-    x = (x - global_mean.reshape(1, -1)) / (global_std.reshape(1, -1) + 1e-6)
+def process_and_infer(current_buffer):
+    """
+    버퍼 데이터를 DataFrame으로 변환 -> (PCA) -> (Exclude) -> (Normalize) -> Inference
+    """
+    # 1. Convert to DataFrame
+    df = pd.DataFrame(current_buffer)
+    
+    # 필요한 컬럼이 다 있는지 확인 (없으면 0으로 채움)
+    for c in ALL_SENSOR_COLS:
+        if c not in df.columns: df[c] = 0.0
+    
+    # 2. [OPTIONAL] Apply PCA Alignment
+    # 주의: Exclude하기 '전'에 전체 6축(또는 3축)이 살아있을 때 수행해야 함
+    if ALIGN_AXES:
+        df = apply_pca_alignment(df)
+        
+    # 3. Exclude Axes & Select Columns
+    # 실제 모델 입력에 필요한 컬럼만 추출
+    feats = df[MODEL_INPUT_COLS].values.astype(np.float32) # [T, C]
+    
+    # 4. Channel Normalization (Z-score)
+    # (T, C) - (C,) / (C,)
+    feats = (feats - NORM_MEAN) / NORM_STD
+    
+    # 5. Tensor Conversion [Batch=1, C, T]
+    feats_t = np.transpose(feats, (1, 0)) # [C, T]
+    x_tensor = torch.from_numpy(feats_t).unsqueeze(0).to(DEVICE) # [1, C, T]
+    
+    # 6. Inference
+    with torch.no_grad():
+        _, z = model_ae(x_tensor)       # z: [1, Latent, T]
+        
+        # Latent Kalman Smoothing
+        z_np = z.cpu().numpy()          # [1, D, T]
+        z_seq = np.transpose(z_np[0], (1, 0)) # [T, D]
+        
+        kf = SimpleKalman(z_seq.shape[1])
+        z_filtered = kf.filter(z_seq)   # [T, D]
+        
+        z_pool = z_filtered.mean(axis=0, keepdims=True) # [1, D]
+        
+        # Classifier
+        logits = model_clf(torch.from_numpy(z_pool).float().to(DEVICE))
+        prob = torch.sigmoid(logits).item()
+        
+    return prob
 
-    # [T, 6] -> [1, 6, T]
-    x = np.transpose(x, (1, 0))  # [6, T]
-    x_tensor = torch.from_numpy(x).unsqueeze(0).float().to(DEVICE)  # [1, 6, T]
 
-    # AE 인코딩
-    _, z = ae(x_tensor)          # z: [1, D, T]
-    z_np = z.cpu().numpy()
-    B, D, T = z_np.shape
-    z_np = np.transpose(z_np, (0, 2, 1))  # [B, T, D]
-
-    # Kalman smoothing
-    kal = SimpleKalman(dim=D, process_var=1e-3, measure_var=1e-2)
-    zf = np.zeros_like(z_np)
-    for b in range(B):
-        zf[b] = kal.filter(z_np[b])
-
-    # 시간 평균 풀링
-    z_pool = zf.mean(axis=1)  # [B, D]
-    z_pool_tensor = torch.from_numpy(z_pool).float().to(DEVICE)
-
-    logits = clf(z_pool_tensor).cpu().numpy()  # [B]
-    prob = 1.0 / (1.0 + np.exp(-logits[0]))
-    pred = int(prob >= threshold)
-    text = "abnormal" if pred == 1 else "normal"
-
-    return float(prob), pred, text
-
-
-# ----------------- Flask 서버 -----------------
-app = Flask(__name__)
-
-SESSIONS: Dict[str, SessionBuffer] = {}
-
-AE_MODEL, CLF_HEAD, GLOBAL_MEAN, GLOBAL_STD = load_fold3_model_and_norm()
-
-
-@app.route("/data", methods=["POST"])
-def handle_data():
+# ==============================================================================
+# 5. API Endpoints
+# ==============================================================================
+@app.route('/predict', methods=['POST'])
+def predict():
+    global buffer_data
+    
     try:
-        data = request.get_json(force=True)
+        data = request.json  # Expect list of dicts or single dict
+        if isinstance(data, dict):
+            data = [data]
+            
+        with buffer_lock:
+            buffer_data.extend(data)
+            # 버퍼 크기 유지
+            if len(buffer_data) > BUFFER_Limit:
+                buffer_data = buffer_data[-BUFFER_Limit:]
+            
+            curr_len = len(buffer_data)
+        
+        # 윈도우 크기만큼 데이터가 모였는지 확인
+        if curr_len >= WINDOW_LEN:
+            # 추론용 데이터 스냅샷 (마지막 WINDOW_LEN개)
+            snapshot = buffer_data[-WINDOW_LEN:]
+            
+            prob = process_and_infer(snapshot)
+            status = "FALL" if prob >= THRESHOLD else "NORMAL"
+            
+            return jsonify({
+                "status": "ok",
+                "prediction": status,
+                "probability": round(prob, 4),
+                "threshold": THRESHOLD,
+                "window_size": len(snapshot)
+            })
+        else:
+            return jsonify({
+                "status": "buffering",
+                "current_length": curr_len,
+                "required": WINDOW_LEN
+            })
+
     except Exception as e:
-        print("[ERROR] JSON parse failed:", e)
-        return jsonify({"status": "error", "msg": "invalid JSON"}), 400
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-    session_id = data.get("sessionId", "default")
-    payload    = data.get("payload", [])
-
-    if not isinstance(payload, list):
-        return jsonify({"status": "error", "msg": "payload must be a list"}), 400
-
-    buf = SESSIONS.get(session_id)
-    if buf is None:
-        buf = SessionBuffer()
-        SESSIONS[session_id] = buf
-
-    buf.update_from_payload(payload)
-
-    window = buf.current_window()
-    num    = buf.num_samples()
-
-    if window is None:
-        # 아직 30초 분량이 안 쌓인 경우
-        return jsonify({
-            "status": "buffering",
-            "sessionId": session_id,
-            "num_samples_resampled": int(num),
-            "required_samples": int(WIN_LEN),
-        })
-
-    prob, pred, text_label = predict_window(
-        AE_MODEL, CLF_HEAD, window,
-        GLOBAL_MEAN, GLOBAL_STD,
-        THRESHOLD,
-    )
-
-    print(f"[PRED] session={session_id} prob={prob:.3f} pred={text_label}")
-
-    return jsonify({
-        "status": "ok",
-        "sessionId": session_id,
-        "window_sec": WINDOW_SEC,
-        "target_hz": TARGET_HZ,
-        "prob_label1": prob,      # label=1 확률 (이걸 abnormal 쪽으로 쓰는지, normal로 쓰는지만 프로젝트 정의에 맞게)
-        "threshold": THRESHOLD,
-        "pred_label": int(pred),  # 0 or 1
-        "pred_text": text_label,  # "normal" / "abnormal"
-    })
+@app.route('/reset', methods=['POST'])
+def reset_buffer():
+    global buffer_data
+    with buffer_lock:
+        buffer_data = []
+    return jsonify({"status": "reset_complete"})
 
 
-if __name__ == "__main__":
-    # 예: 0.0.0.0:8000 에서 리슨
-    app.run(host="0.0.0.0", port=8000, debug=False)
+# ==============================================================================
+# 6. Main Entry
+# ==============================================================================
+if __name__ == '__main__':
+    load_resources()
+    print(f"[START] Server running on port {PORT}...")
+    app.run(host='0.0.0.0', port=PORT, threaded=True)
 
