@@ -3,8 +3,13 @@
 
 """
 IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + K-Fold CV
-전 피험자 합본(Global) 학습 + 훈련 통계로 채널별 표준화 + PCA 2D 시각화 + SVM/LogReg 경계
-F1-score 출력/저장 + per-fold F1 최적 threshold 탐색 + class-weighted BCE
+[수정 반영 완료]
+1. --use_uncalibrated: Uncalibrated csv 파일 로드 허용 (중복 타임스탬프는 평균값 병합으로 해결)
+2. --align_axes: PCA를 통해 데이터의 축을 신호의 분산 방향으로 정렬 (센서 부착 방향 정보 제거)
+3. --exclude_axes: 특정 축(예: az gz)을 입력 피처에서 제거
+4. [NEW] Global Aggregation: 
+   - Fold별 Metric(기존 방식) 그대로 출력/저장
+   - 전체 합산 데이터 기준 Global Threshold 산출 및 Global Metric 추가 출력/저장
 """
 
 import os, io, csv, re, math, json, argparse
@@ -132,6 +137,7 @@ def resample_df(df: pd.DataFrame, target_hz: int) -> pd.DataFrame:
     rule = pd.to_timedelta(1/target_hz, unit="s")
     idx = pd.date_range(df.index.min(), df.index.max(), freq=rule)
     df = df.infer_objects(copy=False)
+    # reindex 전에 중복 인덱스가 없음을 보장해야 함
     df = df.reindex(df.index.union(idx)).interpolate(method='time').reindex(idx)
     return df
 
@@ -170,9 +176,31 @@ def _parse_sensor_csv(raw_bytes: bytes, zip_name: str, inner_name: str) -> Optio
     out = out.dropna(subset=['timestamp']).set_index('timestamp').sort_index().dropna(how='all')
     return out if not out.empty else None
 
+def align_axes_via_pca(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    가속도(ax, ay, az)의 주성분을 계산하여 데이터 전체를 회전.
+    """
+    if len(df) < 10: return df
+    
+    acc_cols = ['ax', 'ay', 'az']
+    if not all(c in df.columns for c in acc_cols): return df
+    
+    acc_data = df[acc_cols].values
+    pca = PCA(n_components=3)
+    pca.fit(acc_data)
+    
+    df[acc_cols] = pca.transform(acc_data)
+    
+    gyr_cols = ['gx', 'gy', 'gz']
+    if all(c in df.columns for c in gyr_cols):
+        R = pca.components_
+        df[gyr_cols] = df[gyr_cols].values @ R.T
+
+    return df
+
 
 # ------------------ Read from zip & merge ------------------
-def read_all_series_from_zip(zip_path: Path, target_hz: int):
+def read_all_series_from_zip(zip_path: Path, target_hz: int, use_uncalibrated: bool, align_axes: bool):
     import zipfile
     acc_list, gyr_list = [], []
     with zipfile.ZipFile(zip_path, 'r') as z:
@@ -183,14 +211,22 @@ def read_all_series_from_zip(zip_path: Path, target_hz: int):
             if not (low.endswith('.csv') or low.endswith('.tsv') or low.endswith('.txt')): continue
             if info.file_size == 0:
                 print(f"[WARN] Empty file skipped: {zip_path.name}:{name}"); continue
-            is_acc = ('accelerometer' in low) and ('uncalibrated' not in low)
-            is_gyr = ('gyroscope' in low) and ('uncalibrated' not in low)
+            
+            is_uncalib = 'uncalibrated' in low
+            if is_uncalib and not use_uncalibrated:
+                continue 
+            
+            is_acc = 'accelerometer' in low
+            is_gyr = 'gyroscope' in low
+            
             if not (is_acc or is_gyr): continue
+
             with z.open(name) as fbin:
                 raw = fbin.read()
             df = _parse_sensor_csv(raw, zip_path.name, name)
             if df is None or df.empty:
                 print(f"[WARN] Failed to parse CSV: {zip_path.name}:{name}"); continue
+            
             if is_acc:
                 acc_list.append(df.rename(columns={'x':'ax','y':'ay','z':'az'})[['ax','ay','az']])
             else:
@@ -198,15 +234,26 @@ def read_all_series_from_zip(zip_path: Path, target_hz: int):
 
     if not acc_list and not gyr_list: return []
     df_all = None
-    if acc_list: df_all = pd.concat(acc_list).sort_index()
+    
+    # [FIX] Duplicate timestamp handling via groupby mean
+    if acc_list: 
+        df_all = pd.concat(acc_list).sort_index()
+        df_all = df_all.groupby(level=0).mean()
+
     if gyr_list:
         g = pd.concat(gyr_list).sort_index()
+        g = g.groupby(level=0).mean()
         df_all = g if df_all is None else df_all.join(g, how='outer')
 
     for c in SENSOR_COLS:
         if c in df_all.columns: df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
     df_all = df_all.dropna(how='all')
+    
     df_all = resample_df(df_all, target_hz).interpolate(limit_direction='both')
+
+    if align_axes and not df_all.empty:
+        df_all = align_axes_via_pca(df_all)
+
     return [df_all]
 
 
@@ -218,12 +265,12 @@ class WindowData:
     group: str          # 원 zip stem (참고용)
 
 class ChannelNormalizer:
-    """채널별 z-score 표준화: 훈련 폴드로 fit, (x-mean)/std"""
     def __init__(self):
-        self.mean = None  # [C]
-        self.std  = None  # [C]
+        self.mean = None
+        self.std  = None
 
     def fit(self, items: List[WindowData]):
+        if not items: return
         C = items[0].feats.shape[0]
         s = np.zeros(C, dtype=np.float64)
         ss = np.zeros(C, dtype=np.float64)
@@ -239,7 +286,7 @@ class ChannelNormalizer:
         self.std  = np.sqrt(np.maximum(v, 1e-8)).astype(np.float32)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B,C,T]
+        if self.mean is None: return x
         mean = torch.from_numpy(self.mean).to(x.device).view(1, -1, 1)
         std  = torch.from_numpy(self.std ).to(x.device).view(1, -1, 1)
         return (x - mean) / std
@@ -250,7 +297,7 @@ class WindowDatasetTorch(Dataset):
     def __len__(self): return len(self.items)
     def __getitem__(self, idx):
         w = self.items[idx]
-        x = torch.from_numpy(w.feats)  # [C,T]
+        x = torch.from_numpy(w.feats)
         if self.norm is not None and self.norm.mean is not None:
             x = (x - torch.from_numpy(self.norm.mean).view(-1,1)) / torch.from_numpy(self.norm.std).view(-1,1)
         return x, torch.tensor(w.label, dtype=torch.float32)
@@ -259,33 +306,47 @@ def collate_fn(batch):
     xs, ys = zip(*batch)
     return torch.stack(xs, dim=0), torch.stack(ys, dim=0)
 
-def build_windows_from_series(df: pd.DataFrame, win_sec: int, stride_sec: int, label: int, target_hz: int, group: str, trim_sec: int = 5):
-    for c in SENSOR_COLS:
+def build_windows_from_series(
+    df: pd.DataFrame, win_sec: int, stride_sec: int, label: int, 
+    target_hz: int, group: str, trim_sec: int, excluded_axes: List[str]
+):
+    valid_cols = [c for c in SENSOR_COLS if c not in excluded_axes]
+    for c in valid_cols:
         if c not in df.columns: df[c] = np.nan
         df[c] = pd.to_numeric(df[c], errors='coerce')
-    df = df.dropna(subset=SENSOR_COLS)
+        
+    df = df.dropna(subset=valid_cols)
     if df.empty: return []
+    
     if trim_sec and trim_sec > 0:
         n_trim = trim_sec * target_hz
         if len(df) > n_trim * 2: df = df.iloc[n_trim:-n_trim]
         else: return []
-    arr = df[SENSOR_COLS].to_numpy(dtype=np.float32)
+        
+    arr = df[valid_cols].to_numpy(dtype=np.float32)
     win_len = win_sec * target_hz; stride = stride_sec * target_hz
     ws = window_stack(arr, win_len, stride)
     if ws.shape[0] == 0: return []
     ws = np.transpose(ws, (0, 2, 1))  # [N,C,T]
     return [WindowData(feats=ws[i], label=label, group=group) for i in range(ws.shape[0])]
 
-def load_dataset(data_root: Path, target_hz: int, win_sec: int, stride_sec: int, trim_sec: int):
+def load_dataset(data_root: Path, target_hz: int, win_sec: int, stride_sec: int, trim_sec: int,
+                 use_uncalibrated: bool, align_axes: bool, excluded_axes: List[str]):
     items: List[WindowData] = []
     for lbl_name, lbl_val in [("o",1),("x",0)]:
+        if not (data_root / lbl_name).exists(): continue
         for zp in sorted((data_root / lbl_name).glob("*.zip")):
-            for df in read_all_series_from_zip(zp, target_hz):
-                items.extend(build_windows_from_series(df, win_sec, stride_sec, lbl_val, target_hz, group=zp.stem, trim_sec=trim_sec))
+            dfs = read_all_series_from_zip(zp, target_hz, use_uncalibrated, align_axes)
+            for df in dfs:
+                wins = build_windows_from_series(
+                    df, win_sec, stride_sec, lbl_val, target_hz, 
+                    group=zp.stem, trim_sec=trim_sec, excluded_axes=excluded_axes
+                )
+                items.extend(wins)
     return items
 
 
-# ------------------ Simple Kalman (for latent smoothing) ------------------
+# ------------------ Simple Kalman ------------------
 class SimpleKalman:
     def __init__(self, dim: int, process_var: float = 1e-3, measure_var: float = 1e-2):
         self.q = process_var; self.r = measure_var
@@ -310,8 +371,8 @@ class Encoder1D(nn.Module):
             nn.Conv1d(hidden, hidden, 5, padding=2), nn.ReLU(), nn.BatchNorm1d(hidden),
             nn.Conv1d(hidden, latent, 3, padding=1), nn.ReLU(),
         )
-    def forward(self, x):  # [B,C,T]
-        return self.net(x)  # [B,latent,T]
+    def forward(self, x):
+        return self.net(x)
 
 class Decoder1D(nn.Module):
     def __init__(self, latent=32, hidden=64, out_ch=6):
@@ -333,7 +394,7 @@ class AE1D(nn.Module):
         z = self.enc(x); xr = self.dec(z)
         return xr, z
     def pooled_latent(self, z):
-        return z.mean(dim=-1)  # [B,latent]
+        return z.mean(dim=-1)
 
 class ProjectionHead(nn.Module):
     def __init__(self, in_dim, proj_dim=64):
@@ -352,7 +413,7 @@ class SupConLoss(nn.Module):
         self.t = temperature
     def forward(self, features, labels):
         device = features.device
-        sim = torch.matmul(features, features.t()) / self.t  # [B,B]
+        sim = torch.matmul(features, features.t()) / self.t
         y = labels.view(-1,1)
         mask_pos = (y == y.t()).float().to(device)
         mask_pos.fill_diagonal_(0)
@@ -365,7 +426,6 @@ class SupConLoss(nn.Module):
         return loss.mean()
 
 class LatentClassifier(nn.Module):
-    """Latent → 이진 로짓. Dropout 추가로 약간의 regularization."""
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
@@ -373,22 +433,16 @@ class LatentClassifier(nn.Module):
             nn.Dropout(p=0.3),
             nn.Linear(hidden, 1)
         )
-    def forward(self, x):  # [B,in_dim]
+    def forward(self, x):
         return self.net(x).squeeze(-1)
 
 
-# ------------------ Training (Discriminative AE) ------------------
+# ------------------ Training ------------------
 def train_discriminative_ae(
-    ae: AE1D,
-    clf_head: LatentClassifier,
-    proj_head: ProjectionHead,
-    loader: DataLoader,
-    valloader: Optional[DataLoader],
+    ae: AE1D, clf_head: LatentClassifier, proj_head: ProjectionHead,
+    loader: DataLoader, valloader: Optional[DataLoader],
     epochs: int, lr: float, device: str,
-    # loss 비율: 분류쪽 가중치를 조금 더 키움
-    w_rec: float = 0.5, w_con: float = 0.5, w_cls: float = 1.0,
-    temperature: float = 0.07,
-    # BCE class weight
+    w_rec: float = 0.5, w_con: float = 0.5, w_cls: float = 1.0, temperature: float = 0.07,
     cls_w_pos: float = 1.0, cls_w_neg: float = 1.0
 ):
     ae.train(); clf_head.train(); proj_head.train()
@@ -401,23 +455,16 @@ def train_discriminative_ae(
         for xb, yb in loader:
             xb = xb.to(device); yb = yb.to(device)
             opt.zero_grad()
-            xr, z = ae(xb)               # xr:[B,C,T], z:[B,D,T]
-            z_pool = ae.pooled_latent(z) # [B,D]
-            logits = clf_head(z_pool)    # [B]
-            z_proj = proj_head(z_pool)   # [B,P]
+            xr, z = ae(xb)
+            z_pool = ae.pooled_latent(z)
+            logits = clf_head(z_pool)
+            z_proj = proj_head(z_pool)
 
             loss_rec = recon(xr, xb)
             loss_con = supcon(z_proj, yb)
 
-            # class-weighted BCE
-            bce_raw = nn.functional.binary_cross_entropy_with_logits(
-                logits, yb, reduction='none'
-            )
-            cls_weights = torch.where(
-                yb > 0.5,
-                torch.tensor(cls_w_pos, device=yb.device),
-                torch.tensor(cls_w_neg, device=yb.device),
-            )
+            bce_raw = nn.functional.binary_cross_entropy_with_logits(logits, yb, reduction='none')
+            cls_weights = torch.where(yb > 0.5, torch.tensor(cls_w_pos, device=yb.device), torch.tensor(cls_w_neg, device=yb.device))
             loss_cls = (bce_raw * cls_weights).mean()
 
             loss = w_rec*loss_rec + w_con*loss_con + w_cls*loss_cls
@@ -435,41 +482,31 @@ def train_discriminative_ae(
                     z_pool = ae.pooled_latent(z)
                     logits = clf_head(z_pool)
                     z_proj = proj_head(z_pool)
-
                     loss_rec = recon(xr, xb)
                     loss_con = supcon(z_proj, yb)
-
-                    bce_raw = nn.functional.binary_cross_entropy_with_logits(
-                        logits, yb, reduction='none'
-                    )
-                    cls_weights = torch.where(
-                        yb > 0.5,
-                        torch.tensor(cls_w_pos, device=yb.device),
-                        torch.tensor(cls_w_neg, device=yb.device),
-                    )
+                    bce_raw = nn.functional.binary_cross_entropy_with_logits(logits, yb, reduction='none')
+                    cls_weights = torch.where(yb > 0.5, torch.tensor(cls_w_pos, device=yb.device), torch.tensor(cls_w_neg, device=yb.device))
                     loss_cls = (bce_raw * cls_weights).mean()
-
                     s += (w_rec*loss_rec + w_con*loss_con + w_cls*loss_cls).item() * xb.size(0); m += xb.size(0)
             val = s / max(1,m)
             ae.train(); clf_head.train(); proj_head.train()
         print(f"[DAE] Epoch {ep}/{epochs} train={tr/max(1,n):.4f} val={val:.4f}")
 
 
-# ------------------ Inference helpers (DAE logits + latent) ------------------
 @torch.no_grad()
 def dae_logits_and_latent(ae: AE1D, clf_head: LatentClassifier, loader: DataLoader, device: str, kalman_proc=1e-3, kalman_meas=1e-2):
     ae.eval(); clf_head.eval()
     probs_list=[]; y_list=[]; latent_list=[]
     for xb, yb in loader:
         xb = xb.to(device)
-        xr, z = ae(xb)        # z:[B,D,T]
+        xr, z = ae(xb)
         z = z.cpu().numpy()
         B,D,T = z.shape
-        z = np.transpose(z, (0,2,1))  # [B,T,D]
+        z = np.transpose(z, (0,2,1))
         zf = np.zeros_like(z)
         for b in range(B):
             zf[b] = SimpleKalman(D, kalman_proc, kalman_meas).filter(z[b])
-        z_pool = zf.mean(axis=1)              # [B,D]
+        z_pool = zf.mean(axis=1)
         logits = clf_head(torch.from_numpy(z_pool).float().to(device)).cpu().numpy()
         probs = 1/(1+np.exp(-logits))
         probs_list.append(probs); y_list.append(yb.numpy()); latent_list.append(z_pool)
@@ -479,15 +516,13 @@ def dae_logits_and_latent(ae: AE1D, clf_head: LatentClassifier, loader: DataLoad
         return np.array([]), np.array([]), np.zeros((0, ae.latent_dim), dtype=np.float32)
 
 
-# ------------------ PCA + Curved Boundary (with Standardization) ------------------
 def _plot_latent_pca_with_dae_boundary(
     X_latent_tr: np.ndarray, y_true_tr: np.ndarray, dae_pred_tr: np.ndarray,
     X_latent_te: np.ndarray, y_true_te: np.ndarray, dae_pred_te: np.ndarray,
     out_tr: Path, out_te: Path, title_tr: str, title_te: str,
     boundary_mode: str = 'rbf_svm', svm_c: float = 1.0, svm_gamma: Union[str,float] = 'scale'
 ):
-    if X_latent_tr.shape[0] == 0:
-        return
+    if X_latent_tr.shape[0] == 0: return
 
     pca = PCA(n_components=2, random_state=42)
     Ztr = pca.fit_transform(X_latent_tr)
@@ -544,7 +579,6 @@ def _plot_latent_pca_with_dae_boundary(
     plot_one(Zte_s, y_true_te, out_te, title_te)
 
 
-# ------------------ Confusion matrix plot ------------------
 def _plot_confusion(y_true, y_pred, outpath, title):
     if y_true.size == 0 or y_pred.size == 0: return
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
@@ -576,9 +610,13 @@ class Args:
     hidden: int
     device: str
     save_dir: str
-    boundary_mode: str   # 'rbf_svm' | 'logreg' | 'auto'
+    boundary_mode: str
     svm_c: float
-    svm_gamma: Union[str, float]  # 'scale'|'auto'|float
+    svm_gamma: Union[str, float]
+    
+    use_uncalibrated: bool
+    align_axes: bool
+    exclude_axes: List[str]
 
 
 def _parse_gamma(g: str) -> Union[str, float]:
@@ -586,17 +624,27 @@ def _parse_gamma(g: str) -> Union[str, float]:
     except: return g
 
 
-# ------------------ Run (Global CV with channel normalization) ------------------
+# ------------------ Run ------------------
 def run(args: Args):
     set_seed(42)
     device = args.device if torch.cuda.is_available() and args.device.startswith('cuda') else 'cpu'
 
     data_root = Path(args.data_root)
     print("[INFO] Loading dataset...")
-    items = load_dataset(data_root, args.target_hz, args.window_sec, args.stride_sec, args.trim_sec)
+    
+    items = load_dataset(
+        data_root, args.target_hz, args.window_sec, args.stride_sec, args.trim_sec,
+        use_uncalibrated=args.use_uncalibrated,
+        align_axes=args.align_axes,
+        excluded_axes=args.exclude_axes
+    )
+    
     if len(items) == 0:
         raise RuntimeError("No usable windows built. Check data paths and CSV format.")
     print(f"[INFO] Total windows: {len(items)} (pos={sum(i.label for i in items)}, neg={len(items)-sum(i.label for i in items)})")
+
+    n_input_ch = items[0].feats.shape[0]
+    print(f"[INFO] Model input channels: {n_input_ch} (Excluded: {args.exclude_axes})")
 
     all_idx = np.arange(len(items))
     kf = KFold(n_splits=args.folds, shuffle=True, random_state=42)
@@ -605,23 +653,37 @@ def run(args: Args):
 
     svm_gamma_final = _parse_gamma(str(args.svm_gamma))
 
+    # [GLOBAL ACCUMULATION]
+    global_accum = {
+        "tr_p": [], "tr_y": [], "tr_lat": [],
+        "te_p": [], "te_y": [], "te_lat": []
+    }
+
+    def to_metrics(p, y, thr: float = 0.5):
+        if y.size==0:
+            return (float('nan'), float('nan'), float('nan'), {}), np.array([]).astype(int)
+        yhat = (p>=thr).astype(int)
+        try: roc = roc_auc_score(y, p)
+        except: roc = float('nan')
+        try: pr  = average_precision_score(y, p)
+        except: pr = float('nan')
+        f1 = f1_score(y.astype(int), yhat.astype(int), zero_division=0)
+        rep = classification_report(y, yhat, output_dict=True, zero_division=0)
+        return (roc, pr, f1, rep), yhat
+
     for fold, (train_idx, val_idx) in enumerate(kf.split(all_idx), 1):
         print(f"\n======= Fold {fold}/{args.folds} (GLOBAL) =======")
         train_items = [items[i] for i in train_idx]
         val_items   = [items[i] for i in val_idx]
 
-        # --- 채널별 표준화 통계 (train fold) ---
         ch_norm = ChannelNormalizer(); ch_norm.fit(train_items)
 
-        # --- class 비율로 BCE weight 계산 ---
         num_pos = sum(it.label for it in train_items)
         num_neg = len(train_items) - num_pos
-        print(f"[FOLD {fold}] pos={num_pos}, neg={num_neg}")
         cls_w_pos = num_neg / (num_pos + 1e-8)
         cls_w_neg = num_pos / (num_neg + 1e-8)
 
-        # --- 모델 ---
-        ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
+        ae = AE1D(in_ch=n_input_ch, hidden=args.hidden, latent=args.latent).to(device)
         clf_head = LatentClassifier(in_dim=args.latent, hidden=args.hidden).to(device)
         proj_head = ProjectionHead(in_dim=args.latent, proj_dim=64).to(device)
 
@@ -630,7 +692,6 @@ def run(args: Args):
         va_loader = DataLoader(WindowDatasetTorch(val_items, ch_norm),   batch_size=args.batch_size,
                                shuffle=False, drop_last=False, collate_fn=collate_fn)
 
-        print("[INFO] Train Discriminative AE (recon + supcon + class-weighted bce)...")
         if len(tr_loader.dataset)>0:
             train_discriminative_ae(
                 ae, clf_head, proj_head,
@@ -639,40 +700,30 @@ def run(args: Args):
                 w_rec=0.5, w_con=0.5, w_cls=1.0, temperature=0.07,
                 cls_w_pos=cls_w_pos, cls_w_neg=cls_w_neg
             )
-        else:
-            print("[WARN] Empty training set for DAE.")
-
-        # --- 평가 & 메트릭 ---
-        print("[INFO] Evaluate & collect latent...")
+        
         p_tr, y_tr, Ztr = dae_logits_and_latent(ae, clf_head, tr_loader, device)
         p_te, y_te, Zte = dae_logits_and_latent(ae, clf_head, va_loader, device)
 
-        def to_metrics(p, y, thr: float = 0.5):
-            if y.size==0:
-                return (float('nan'), float('nan'), float('nan'), {}), np.array([]).astype(int)
-            yhat = (p>=thr).astype(int)
-            try: roc = roc_auc_score(y, p)
-            except: roc = float('nan')
-            try: pr  = average_precision_score(y, p)
-            except: pr = float('nan')
-            f1 = f1_score(y.astype(int), yhat.astype(int), zero_division=0)
-            rep = classification_report(y, yhat, output_dict=True, zero_division=0)
-            return (roc, pr, f1, rep), yhat
+        # [ACCUMULATE FOR GLOBAL]
+        global_accum["tr_p"].append(p_tr)
+        global_accum["tr_y"].append(y_tr)
+        global_accum["tr_lat"].append(Ztr)
+        global_accum["te_p"].append(p_te)
+        global_accum["te_y"].append(y_te)
+        global_accum["te_lat"].append(Zte)
 
-        # --- Train F1 기준 best threshold 탐색 ---
+        # [EXISTING] Fold-specific Threshold Search & Printing
         best_thr = 0.5
-        best_f1  = float('nan')
         if y_tr.size > 0:
             best_f1 = -1.0
-            for thr in np.linspace(0.05, 0.95, 181):  # 0.05 ~ 0.95, step=0.005
+            for thr in np.linspace(0.05, 0.95, 181):
                 yhat_tmp = (p_tr >= thr).astype(int)
                 f1_tmp = f1_score(y_tr.astype(int), yhat_tmp.astype(int), zero_division=0)
                 if f1_tmp > best_f1:
                     best_f1, best_thr = f1_tmp, thr
             print(f"[FOLD {fold}] Best train F1={best_f1:.4f} at threshold={best_thr:.3f}")
-        else:
-            print(f"[FOLD {fold}] No train samples, using default threshold={best_thr:.3f}")
-
+        
+        # [EXISTING] Fold-specific Evaluation (Preserved)
         (roc_tr, pr_tr, f1_tr, rep_tr), y_tr_hat = to_metrics(p_tr, y_tr, thr=best_thr)
         (roc_te, pr_te, f1_te, rep_te), y_te_hat = to_metrics(p_te, y_te, thr=best_thr)
 
@@ -681,7 +732,6 @@ def run(args: Args):
         print(f"[FOLD {fold}] F1      train/test = {f1_tr:.4f} / {f1_te:.4f}")
         print(f"[FOLD {fold}] Used threshold = {best_thr:.3f}")
 
-        # 저장
         fold_report = {
             "fold": fold,
             "threshold": float(best_thr),
@@ -693,10 +743,8 @@ def run(args: Args):
         torch.save({"ae": ae.state_dict(), "clf_head": clf_head.state_dict(), "proj_head": proj_head.state_dict()},
                    Path(args.save_dir)/f"fold{fold}_ckpt.pt")
 
-        # ---------- 시각화 ----------
         figs_dir = Path(args.save_dir)/f"figs_fold{fold}"
         figs_dir.mkdir(parents=True, exist_ok=True)
-
         _plot_latent_pca_with_dae_boundary(
             X_latent_tr=Ztr, y_true_tr=y_tr, dae_pred_tr=(p_tr>=best_thr).astype(int),
             X_latent_te=Zte, y_true_te=y_te, dae_pred_te=(p_te>=best_thr).astype(int),
@@ -706,24 +754,64 @@ def run(args: Args):
             title_te=f"Fold {fold} — Test Latent (PCA+Std) + boundary",
             boundary_mode=args.boundary_mode, svm_c=args.svm_c, svm_gamma=svm_gamma_final
         )
+        _plot_confusion(y_tr.astype(int), y_tr_hat, figs_dir/"train_confusion_dae.png", f"Fold {fold} — Train Confusion")
+        _plot_confusion(y_te.astype(int), y_te_hat, figs_dir/"test_confusion_dae.png", f"Fold {fold} — Test Confusion")
 
-        _plot_confusion(y_tr.astype(int), y_tr_hat, figs_dir/"train_confusion_dae.png",
-                        f"Fold {fold} — Train Confusion (DAE)")
-        _plot_confusion(y_te.astype(int), y_te_hat, figs_dir/"test_confusion_dae.png",
-                        f"Fold {fold} — Test Confusion (DAE)")
+    # ------------------ Global Aggregation & Evaluation (NEW) ------------------
+    print("\n======= GLOBAL EVALUATION (AGGREGATED) =======")
+    
+    # 1. 합산 (Concatenate)
+    g_tr_p = np.concatenate(global_accum["tr_p"]) if global_accum["tr_p"] else np.array([])
+    g_tr_y = np.concatenate(global_accum["tr_y"]) if global_accum["tr_y"] else np.array([])
+    g_te_p = np.concatenate(global_accum["te_p"]) if global_accum["te_p"] else np.array([])
+    g_te_y = np.concatenate(global_accum["te_y"]) if global_accum["te_y"] else np.array([])
 
+    # 2. Global Threshold 탐색 (전체 Train 데이터 기준)
+    best_g_thr = 0.5
+    best_g_f1 = float('nan')
+    if g_tr_y.size > 0:
+        best_g_f1 = -1.0
+        for thr in np.linspace(0.05, 0.95, 181):
+            yhat = (g_tr_p >= thr).astype(int)
+            f = f1_score(g_tr_y.astype(int), yhat, zero_division=0)
+            if f > best_g_f1:
+                best_g_f1, best_g_thr = f, thr
+        print(f"[GLOBAL] Best Train F1={best_g_f1:.4f} at threshold={best_g_thr:.3f}")
+    else:
+        print("[GLOBAL] No train data to find threshold.")
+
+    # 3. Global Test 평가 (위에서 구한 Global Threshold 적용)
+    (g_roc, g_pr, g_f1, g_rep), g_yhat = to_metrics(g_te_p, g_te_y, thr=best_g_thr)
+    print(f"[GLOBAL] Test ROC-AUC = {g_roc:.4f}")
+    print(f"[GLOBAL] Test PR-AUC  = {g_pr:.4f}")
+    print(f"[GLOBAL] Test F1      = {g_f1:.4f}")
+    
+    global_report = {
+        "threshold": float(best_g_thr),
+        "train_f1_best": float(best_g_f1),
+        "test": {
+            "roc_auc": g_roc, "pr_auc": g_pr, "f1": g_f1, "report": g_rep
+        }
+    }
+    
+    # 보고서에 global 섹션 추가
+    cv_reports.append({"global": global_report})
     with open(Path(args.save_dir)/"cv_summary.json",'w') as f: json.dump(cv_reports, f, indent=2)
+
+    # Global 시각화
+    _plot_confusion(g_te_y.astype(int), g_yhat, Path(args.save_dir)/"global_confusion.png",
+                    f"Global Aggregated Confusion (Thr={best_g_thr:.3f})")
+
     print("[DONE] Global CV reports & figures saved to", args.save_dir)
 
 
-# ------------------ CLI ------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument('--data_root', type=str, default='./data')
     p.add_argument('--target_hz', type=int, default=50)
     p.add_argument('--window_sec', type=int, default=30)
     p.add_argument('--stride_sec', type=int, default=15)
-    p.add_argument('--trim_sec', type=int, default=5, help='앞뒤로 잘라낼 초(second)')
+    p.add_argument('--trim_sec', type=int, default=5)
     p.add_argument('--epochs_ae', type=int, default=20)
     p.add_argument('--batch_size', type=int, default=64)
     p.add_argument('--lr', type=float, default=1e-3)
@@ -732,13 +820,14 @@ if __name__ == "__main__":
     p.add_argument('--hidden', type=int, default=64)
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--save_dir', type=str, default='./runs_global')
-    # curved boundary options
-    p.add_argument('--boundary_mode', type=str, default='rbf_svm',
-                   choices=['rbf_svm','logreg','auto'],
-                   help="경계 근사 방식: rbf_svm(곡선, 기본), logreg(직선), auto(가능하면 SVM)")
-    p.add_argument('--svm_c', type=float, default=1.0, help='RBF-SVM C')
-    p.add_argument('--svm_gamma', type=str, default='scale',
-                   help="RBF-SVM gamma: 'scale'/'auto' 또는 숫자 문자열(예: '2.0')")
+    p.add_argument('--boundary_mode', type=str, default='rbf_svm', choices=['rbf_svm','logreg','auto'])
+    p.add_argument('--svm_c', type=float, default=1.0)
+    p.add_argument('--svm_gamma', type=str, default='scale')
+    
+    p.add_argument('--use_uncalibrated', action='store_true', help="Uncalibrated (raw) 센서 파일도 포함하여 로드")
+    p.add_argument('--align_axes', action='store_true', help="PCA를 이용해 센서 축을 정렬")
+    p.add_argument('--exclude_axes', nargs='+', default=[], help="사용하지 않을 축 이름 (예: az gz)")
+
     args_ns = p.parse_args()
 
     gamma_val: Union[str, float] = _parse_gamma(args_ns.svm_gamma)
@@ -748,7 +837,9 @@ if __name__ == "__main__":
         epochs_ae=args_ns.epochs_ae, batch_size=args_ns.batch_size, lr=args_ns.lr,
         folds=args_ns.folds, latent=args_ns.latent, hidden=args_ns.hidden,
         device=args_ns.device, save_dir=args_ns.save_dir,
-        boundary_mode=args_ns.boundary_mode, svm_c=args_ns.svm_c, svm_gamma=gamma_val
+        boundary_mode=args_ns.boundary_mode, svm_c=args_ns.svm_c, svm_gamma=gamma_val,
+        use_uncalibrated=args_ns.use_uncalibrated,
+        align_axes=args_ns.align_axes,
+        exclude_axes=args_ns.exclude_axes
     )
     run(args)
-
