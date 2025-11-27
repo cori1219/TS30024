@@ -116,7 +116,10 @@ python main.py \
   --folds 4 \
   --latent 32 --hidden 64 \
   --boundary_mode rbf_svm --svm_c 5.0 --svm_gamma 2.0 \
-  --save_dir ./runs
+  --save_dir ./runs \
+  --use_uncalibrated \
+  --align_axes \
+  --exclude_axes az gz
 ```
 
 ``` bash
