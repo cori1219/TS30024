@@ -3,8 +3,10 @@
 
 """
 IMU 균형 이상 감지 — Discriminative AE (Recon + SupCon + BCE) + Latent Kalman + K-Fold CV
-전 피험자 합본(Global) 학습 + 훈련 통계로 채널별 표준화 + PCA 2D 시각화 + SVM/LogReg 경계
-F1-score 출력/저장 + per-fold F1 최적 threshold 탐색 + class-weighted BCE
+[수정 반영 완료]
+1. --use_uncalibrated: Uncalibrated csv 파일 로드 허용 (중복 타임스탬프는 평균값 병합으로 해결)
+2. --align_axes: PCA를 통해 데이터의 축을 신호의 분산 방향으로 정렬 (센서 부착 방향 정보 제거)
+3. --exclude_axes: 특정 축(예: az gz)을 입력 피처에서 제거
 """
 
 import os, io, csv, re, math, json, argparse
@@ -132,6 +134,7 @@ def resample_df(df: pd.DataFrame, target_hz: int) -> pd.DataFrame:
     rule = pd.to_timedelta(1/target_hz, unit="s")
     idx = pd.date_range(df.index.min(), df.index.max(), freq=rule)
     df = df.infer_objects(copy=False)
+    # reindex 전에 중복 인덱스가 없음을 보장해야 함 (호출하는 쪽에서 처리)
     df = df.reindex(df.index.union(idx)).interpolate(method='time').reindex(idx)
     return df
 
@@ -170,9 +173,41 @@ def _parse_sensor_csv(raw_bytes: bytes, zip_name: str, inner_name: str) -> Optio
     out = out.dropna(subset=['timestamp']).set_index('timestamp').sort_index().dropna(how='all')
     return out if not out.empty else None
 
+# [MODIFIED] Helper: PCA-based rotation to align axes
+def align_axes_via_pca(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    가속도(ax, ay, az)의 주성분을 계산하여 데이터 전체를 회전시킵니다.
+    이를 통해 센서 부착 방향에 따른 편향을 제거하고,
+    데이터를 '신호의 분산이 큰 순서'로 정렬합니다.
+    """
+    if len(df) < 10: return df
+    
+    # 가속도 데이터 추출
+    acc_cols = ['ax', 'ay', 'az']
+    if not all(c in df.columns for c in acc_cols): return df
+    
+    acc_data = df[acc_cols].values
+    
+    # PCA 계산 (3축)
+    pca = PCA(n_components=3)
+    pca.fit(acc_data)
+    
+    # 가속도 회전 적용
+    df[acc_cols] = pca.transform(acc_data)
+    
+    # 자이로도 동일한 회전 행렬 적용 (축의 방향이 같아야 하므로)
+    gyr_cols = ['gx', 'gy', 'gz']
+    if all(c in df.columns for c in gyr_cols):
+        # Rotation Matrix = pca.components_
+        R = pca.components_
+        df[gyr_cols] = df[gyr_cols].values @ R.T
+
+    return df
+
 
 # ------------------ Read from zip & merge ------------------
-def read_all_series_from_zip(zip_path: Path, target_hz: int):
+# [MODIFIED] Added arguments: use_uncalibrated, align_axes, and duplicate fix
+def read_all_series_from_zip(zip_path: Path, target_hz: int, use_uncalibrated: bool, align_axes: bool):
     import zipfile
     acc_list, gyr_list = [], []
     with zipfile.ZipFile(zip_path, 'r') as z:
@@ -183,14 +218,23 @@ def read_all_series_from_zip(zip_path: Path, target_hz: int):
             if not (low.endswith('.csv') or low.endswith('.tsv') or low.endswith('.txt')): continue
             if info.file_size == 0:
                 print(f"[WARN] Empty file skipped: {zip_path.name}:{name}"); continue
-            is_acc = ('accelerometer' in low) and ('uncalibrated' not in low)
-            is_gyr = ('gyroscope' in low) and ('uncalibrated' not in low)
+            
+            # [MODIFIED] Uncalibrated logic
+            is_uncalib = 'uncalibrated' in low
+            if is_uncalib and not use_uncalibrated:
+                continue # Skip if uncalibrated not allowed
+            
+            is_acc = 'accelerometer' in low
+            is_gyr = 'gyroscope' in low
+            
             if not (is_acc or is_gyr): continue
+
             with z.open(name) as fbin:
                 raw = fbin.read()
             df = _parse_sensor_csv(raw, zip_path.name, name)
             if df is None or df.empty:
                 print(f"[WARN] Failed to parse CSV: {zip_path.name}:{name}"); continue
+            
             if is_acc:
                 acc_list.append(df.rename(columns={'x':'ax','y':'ay','z':'az'})[['ax','ay','az']])
             else:
@@ -198,15 +242,30 @@ def read_all_series_from_zip(zip_path: Path, target_hz: int):
 
     if not acc_list and not gyr_list: return []
     df_all = None
-    if acc_list: df_all = pd.concat(acc_list).sort_index()
+    
+    # [FIX] Duplicate timestamp handling via groupby mean
+    if acc_list: 
+        df_all = pd.concat(acc_list).sort_index()
+        # 중복된 인덱스(시간)가 있으면 평균을 내서 하나로 합침
+        df_all = df_all.groupby(level=0).mean()
+
     if gyr_list:
         g = pd.concat(gyr_list).sort_index()
+        g = g.groupby(level=0).mean()
+        
         df_all = g if df_all is None else df_all.join(g, how='outer')
 
     for c in SENSOR_COLS:
         if c in df_all.columns: df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
     df_all = df_all.dropna(how='all')
+    
+    # 중복이 제거되었으므로 리샘플링 안전
     df_all = resample_df(df_all, target_hz).interpolate(limit_direction='both')
+
+    # [MODIFIED] Apply Axis Alignment (Normalization) if requested
+    if align_axes and not df_all.empty:
+        df_all = align_axes_via_pca(df_all)
+
     return [df_all]
 
 
@@ -224,6 +283,7 @@ class ChannelNormalizer:
         self.std  = None  # [C]
 
     def fit(self, items: List[WindowData]):
+        if not items: return
         C = items[0].feats.shape[0]
         s = np.zeros(C, dtype=np.float64)
         ss = np.zeros(C, dtype=np.float64)
@@ -240,6 +300,7 @@ class ChannelNormalizer:
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B,C,T]
+        if self.mean is None: return x
         mean = torch.from_numpy(self.mean).to(x.device).view(1, -1, 1)
         std  = torch.from_numpy(self.std ).to(x.device).view(1, -1, 1)
         return (x - mean) / std
@@ -259,29 +320,51 @@ def collate_fn(batch):
     xs, ys = zip(*batch)
     return torch.stack(xs, dim=0), torch.stack(ys, dim=0)
 
-def build_windows_from_series(df: pd.DataFrame, win_sec: int, stride_sec: int, label: int, target_hz: int, group: str, trim_sec: int = 5):
-    for c in SENSOR_COLS:
+# [MODIFIED] Added excluded_axes to remove specific channels
+def build_windows_from_series(
+    df: pd.DataFrame, win_sec: int, stride_sec: int, label: int, 
+    target_hz: int, group: str, trim_sec: int, excluded_axes: List[str]
+):
+    # Determine valid columns (filtering out excluded axes)
+    valid_cols = [c for c in SENSOR_COLS if c not in excluded_axes]
+
+    for c in valid_cols:
         if c not in df.columns: df[c] = np.nan
         df[c] = pd.to_numeric(df[c], errors='coerce')
-    df = df.dropna(subset=SENSOR_COLS)
+        
+    df = df.dropna(subset=valid_cols)
     if df.empty: return []
+    
     if trim_sec and trim_sec > 0:
         n_trim = trim_sec * target_hz
         if len(df) > n_trim * 2: df = df.iloc[n_trim:-n_trim]
         else: return []
-    arr = df[SENSOR_COLS].to_numpy(dtype=np.float32)
+        
+    arr = df[valid_cols].to_numpy(dtype=np.float32)
     win_len = win_sec * target_hz; stride = stride_sec * target_hz
     ws = window_stack(arr, win_len, stride)
     if ws.shape[0] == 0: return []
     ws = np.transpose(ws, (0, 2, 1))  # [N,C,T]
     return [WindowData(feats=ws[i], label=label, group=group) for i in range(ws.shape[0])]
 
-def load_dataset(data_root: Path, target_hz: int, win_sec: int, stride_sec: int, trim_sec: int):
+# [MODIFIED] Pass new arguments down
+def load_dataset(data_root: Path, target_hz: int, win_sec: int, stride_sec: int, trim_sec: int,
+                 use_uncalibrated: bool, align_axes: bool, excluded_axes: List[str]):
     items: List[WindowData] = []
     for lbl_name, lbl_val in [("o",1),("x",0)]:
+        # 해당 폴더가 없으면 스킵
+        if not (data_root / lbl_name).exists(): continue
+        
         for zp in sorted((data_root / lbl_name).glob("*.zip")):
-            for df in read_all_series_from_zip(zp, target_hz):
-                items.extend(build_windows_from_series(df, win_sec, stride_sec, lbl_val, target_hz, group=zp.stem, trim_sec=trim_sec))
+            # 1. Load & Align (with duplicate fix)
+            dfs = read_all_series_from_zip(zp, target_hz, use_uncalibrated, align_axes)
+            for df in dfs:
+                # 2. Windowing & Column Filtering
+                wins = build_windows_from_series(
+                    df, win_sec, stride_sec, lbl_val, target_hz, 
+                    group=zp.stem, trim_sec=trim_sec, excluded_axes=excluded_axes
+                )
+                items.extend(wins)
     return items
 
 
@@ -579,6 +662,11 @@ class Args:
     boundary_mode: str   # 'rbf_svm' | 'logreg' | 'auto'
     svm_c: float
     svm_gamma: Union[str, float]  # 'scale'|'auto'|float
+    
+    # [MODIFIED] New args
+    use_uncalibrated: bool
+    align_axes: bool
+    exclude_axes: List[str]
 
 
 def _parse_gamma(g: str) -> Union[str, float]:
@@ -593,10 +681,22 @@ def run(args: Args):
 
     data_root = Path(args.data_root)
     print("[INFO] Loading dataset...")
-    items = load_dataset(data_root, args.target_hz, args.window_sec, args.stride_sec, args.trim_sec)
+    
+    # [MODIFIED] Pass new arguments
+    items = load_dataset(
+        data_root, args.target_hz, args.window_sec, args.stride_sec, args.trim_sec,
+        use_uncalibrated=args.use_uncalibrated,
+        align_axes=args.align_axes,
+        excluded_axes=args.exclude_axes
+    )
+    
     if len(items) == 0:
         raise RuntimeError("No usable windows built. Check data paths and CSV format.")
     print(f"[INFO] Total windows: {len(items)} (pos={sum(i.label for i in items)}, neg={len(items)-sum(i.label for i in items)})")
+
+    # [MODIFIED] Calculate actual input channels
+    n_input_ch = items[0].feats.shape[0]
+    print(f"[INFO] Model input channels: {n_input_ch} (Excluded: {args.exclude_axes})")
 
     all_idx = np.arange(len(items))
     kf = KFold(n_splits=args.folds, shuffle=True, random_state=42)
@@ -620,8 +720,8 @@ def run(args: Args):
         cls_w_pos = num_neg / (num_pos + 1e-8)
         cls_w_neg = num_pos / (num_neg + 1e-8)
 
-        # --- 모델 ---
-        ae = AE1D(in_ch=len(SENSOR_COLS), hidden=args.hidden, latent=args.latent).to(device)
+        # --- 모델 (input_ch 반영) ---
+        ae = AE1D(in_ch=n_input_ch, hidden=args.hidden, latent=args.latent).to(device)
         clf_head = LatentClassifier(in_dim=args.latent, hidden=args.hidden).to(device)
         proj_head = ProjectionHead(in_dim=args.latent, proj_dim=64).to(device)
 
@@ -739,6 +839,15 @@ if __name__ == "__main__":
     p.add_argument('--svm_c', type=float, default=1.0, help='RBF-SVM C')
     p.add_argument('--svm_gamma', type=str, default='scale',
                    help="RBF-SVM gamma: 'scale'/'auto' 또는 숫자 문자열(예: '2.0')")
+    
+    # [MODIFIED] New CLI arguments
+    p.add_argument('--use_uncalibrated', action='store_true',
+                   help="Uncalibrated (raw) 센서 파일도 포함하여 로드")
+    p.add_argument('--align_axes', action='store_true',
+                   help="PCA를 이용해 센서 축을 신호 분산 방향으로 정렬 (Orientation Normalization)")
+    p.add_argument('--exclude_axes', nargs='+', default=[],
+                   help="사용하지 않을 축 이름 (예: az gz)")
+
     args_ns = p.parse_args()
 
     gamma_val: Union[str, float] = _parse_gamma(args_ns.svm_gamma)
@@ -748,7 +857,10 @@ if __name__ == "__main__":
         epochs_ae=args_ns.epochs_ae, batch_size=args_ns.batch_size, lr=args_ns.lr,
         folds=args_ns.folds, latent=args_ns.latent, hidden=args_ns.hidden,
         device=args_ns.device, save_dir=args_ns.save_dir,
-        boundary_mode=args_ns.boundary_mode, svm_c=args_ns.svm_c, svm_gamma=gamma_val
+        boundary_mode=args_ns.boundary_mode, svm_c=args_ns.svm_c, svm_gamma=gamma_val,
+        # [MODIFIED]
+        use_uncalibrated=args_ns.use_uncalibrated,
+        align_axes=args_ns.align_axes,
+        exclude_axes=args_ns.exclude_axes
     )
     run(args)
-
