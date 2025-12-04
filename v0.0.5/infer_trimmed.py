@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-여러 data_root(예: ./1, ./2, ./3)에 있는 '잘라놓은 zip'들을
+여러 data_root(예: ./1, ./2, ./3)에 있는 '*_trimmed.zip' 들을
 Discriminative AE + Kalman + classifier (fold*_ckpt.pt) 로 한 번에 분류하는 스크립트.
 
 - 학습 코드(main.py)에 정의된 함수/클래스를 그대로 재사용
@@ -51,6 +51,7 @@ def build_infer_items_for_root(
     """
     특정 data_root(예: ./1) 하나에 대해 WindowData 리스트를 만드는 함수.
 
+    🔹 이제 '*_trimmed.zip' 인 파일만 사용함.
     - WindowData.group 에는 "rootName/zipStem" 형태로 저장해서
       나중에 zip 구분 + root 구분 둘 다 할 수 있게 한다.
     """
@@ -59,14 +60,14 @@ def build_infer_items_for_root(
 
     zip_paths: List[Path] = []
 
-    # 1) data_root 바로 아래 *.zip
-    zip_paths.extend(sorted(data_root.glob("*.zip")))
+    # 1) data_root 바로 아래 *_trimmed.zip 만 사용
+    zip_paths.extend(sorted(data_root.glob("*_trimmed.zip")))
 
-    # 2) data_root/x, data_root/o 안의 zip 도 같이 쓰고 싶으면 유지
+    # 2) data_root/x, data_root/o 안에서도 *_trimmed.zip 만 사용
     if (data_root / "x").exists():
-        zip_paths.extend(sorted((data_root / "x").glob("*.zip")))
+        zip_paths.extend(sorted((data_root / "x").glob("*_trimmed.zip")))
     if (data_root / "o").exists():
-        zip_paths.extend(sorted((data_root / "o").glob("*.zip")))
+        zip_paths.extend(sorted((data_root / "o").glob("*_trimmed.zip")))
 
     # 중복 제거
     uniq: List[Path] = []
@@ -78,10 +79,10 @@ def build_infer_items_for_root(
             seen.add(rp)
 
     if not uniq:
-        print(f"[WARN] '{data_root}' 아래에서 zip 파일을 찾지 못했습니다. (root={root_name})")
+        print(f"[WARN] '{data_root}' 아래에서 *_trimmed.zip 파일을 찾지 못했습니다. (root={root_name})")
         return []
 
-    print(f"[INFO] [{root_name}] Found {len(uniq)} zip files for inference.")
+    print(f"[INFO] [{root_name}] Found {len(uniq)} *_trimmed.zip files for inference.")
     for zp in uniq:
         dfs = read_all_series_from_zip(
             zp,
@@ -94,10 +95,10 @@ def build_infer_items_for_root(
                 df=df,
                 win_sec=window_sec,
                 stride_sec=stride_sec,
-                label=0,               # 추론이니까 라벨은 더미
+                label=0,               # 추론이므로 더미 라벨
                 target_hz=target_hz,
-                group=f"{root_name}/{zp.stem}",  # root/zipStem 형태로 저장
-                trim_sec=trim_sec,     # 이미 잘려있는 zip이면 0 권장
+                group=f"{root_name}/{zp.stem}",  # root/zipStem 형태
+                trim_sec=trim_sec,     # 이미 잘린 zip이라면 0 권장
                 excluded_axes=excluded_axes,
             )
             items.extend(wins)
@@ -135,7 +136,7 @@ def load_model_from_ckpt(
 def main():
     parser = argparse.ArgumentParser()
 
-    # ✅ 여기! data_root 를 여러 개 받도록 변경 (nargs="+")
+    # ✅ 여러 data_root 를 한 번에 받도록 설정 (예: ./1 ./2 ./3)
     parser.add_argument(
         "--data_root",
         nargs="+",
@@ -153,7 +154,7 @@ def main():
     parser.add_argument("--window_sec", type=int, default=30)
     parser.add_argument("--stride_sec", type=int, default=15)
 
-    # ⚠ 이미 zip 자체를 30초만 남기도록 잘라뒀으면 보통 0으로 두는 게 맞음
+    # ⚠ 이미 *_trimmed.zip 이 30초 구간만 남도록 잘려있으면 보통 0으로 두는 게 맞음
     parser.add_argument("--trim_sec", type=int, default=0)
 
     parser.add_argument("--batch_size", type=int, default=64)
