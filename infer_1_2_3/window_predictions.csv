@@ -1,4 +1,4 @@
 ﻿root,zip_stem,group,window_index,prob,pred
-1,x_trimmed,1/x_trimmed,0,0.32936185598373413,0
-2,o_trimmed,2/o_trimmed,0,0.40070053935050964,0
-3,o_trimmed,3/o_trimmed,0,0.5822221636772156,1
+1,x_trimmed,1/x_trimmed,0,0.329361855983734,0
+2,o_trimmed,2/o_trimmed,0,0.40070053935051,1
+3,o_trimmed,3/o_trimmed,0,0.582222163677216,1
